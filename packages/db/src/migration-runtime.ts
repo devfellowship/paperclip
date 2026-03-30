@@ -1,9 +1,8 @@
 import { existsSync, readFileSync, rmSync } from "node:fs";
-import { createRequire } from "node:module";
 import { createServer } from "node:net";
 import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
-import { ensurePostgresDatabase } from "./client.js";
+import { ensurePostgresDatabase, getPostgresDataDirectory } from "./client.js";
+import { createEmbeddedPostgresLogBuffer, formatEmbeddedPostgresError } from "./embedded-postgres-error.js";
 import { resolveDatabaseTarget } from "./runtime-config.js";
 
 type EmbeddedPostgresInstance = {
@@ -28,18 +27,6 @@ export type MigrationConnection = {
   source: string;
   stop: () => Promise<void>;
 };
-
-function toError(error: unknown, fallbackMessage: string): Error {
-  if (error instanceof Error) return error;
-  if (error === undefined) return new Error(fallbackMessage);
-  if (typeof error === "string") return new Error(`${fallbackMessage}: ${error}`);
-
-  try {
-    return new Error(`${fallbackMessage}: ${JSON.stringify(error)}`);
-  } catch {
-    return new Error(`${fallbackMessage}: ${String(error)}`);
-  }
-}
 
 function readRunningPostmasterPid(postmasterPidFile: string): number | null {
   if (!existsSync(postmasterPidFile)) return null;
@@ -90,17 +77,8 @@ async function findAvailablePort(startPort: number): Promise<number> {
 }
 
 async function loadEmbeddedPostgresCtor(): Promise<EmbeddedPostgresCtor> {
-  const require = createRequire(import.meta.url);
-  const resolveCandidates = [
-    path.resolve(fileURLToPath(new URL("../..", import.meta.url))),
-    path.resolve(fileURLToPath(new URL("../../server", import.meta.url))),
-    path.resolve(fileURLToPath(new URL("../../cli", import.meta.url))),
-    process.cwd(),
-  ];
-
   try {
-    const resolvedModulePath = require.resolve("embedded-postgres", { paths: resolveCandidates });
-    const mod = await import(pathToFileURL(resolvedModulePath).href);
+    const mod = await import("embedded-postgres");
     return mod.default as EmbeddedPostgresCtor;
   } catch {
     throw new Error(
@@ -116,8 +94,34 @@ async function ensureEmbeddedPostgresConnection(
   const EmbeddedPostgres = await loadEmbeddedPostgresCtor();
   const selectedPort = await findAvailablePort(preferredPort);
   const postmasterPidFile = path.resolve(dataDir, "postmaster.pid");
+  const pgVersionFile = path.resolve(dataDir, "PG_VERSION");
   const runningPid = readRunningPostmasterPid(postmasterPidFile);
   const runningPort = readPidFilePort(postmasterPidFile);
+  const preferredAdminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${preferredPort}/postgres`;
+  const logBuffer = createEmbeddedPostgresLogBuffer();
+
+  if (!runningPid && existsSync(pgVersionFile)) {
+    try {
+      const actualDataDir = await getPostgresDataDirectory(preferredAdminConnectionString);
+      const matchesDataDir =
+        typeof actualDataDir === "string" &&
+        path.resolve(actualDataDir) === path.resolve(dataDir);
+      if (!matchesDataDir) {
+        throw new Error("reachable postgres does not use the expected embedded data directory");
+      }
+      await ensurePostgresDatabase(preferredAdminConnectionString, "paperclip");
+      process.emitWarning(
+        `Adopting an existing PostgreSQL instance on port ${preferredPort} for embedded data dir ${dataDir} because postmaster.pid is missing.`,
+      );
+      return {
+        connectionString: `postgres://paperclip:paperclip@127.0.0.1:${preferredPort}/paperclip`,
+        source: `embedded-postgres@${preferredPort}`,
+        stop: async () => {},
+      };
+    } catch {
+      // Fall through and attempt to start the configured embedded cluster.
+    }
+  }
 
   if (runningPid) {
     const port = runningPort ?? preferredPort;
@@ -136,19 +140,20 @@ async function ensureEmbeddedPostgresConnection(
     password: "paperclip",
     port: selectedPort,
     persistent: true,
-    initdbFlags: ["--encoding=UTF8", "--locale=C"],
-    onLog: () => {},
-    onError: () => {},
+    initdbFlags: ["--encoding=UTF8", "--locale=C", "--lc-messages=C"],
+    onLog: logBuffer.append,
+    onError: logBuffer.append,
   });
 
   if (!existsSync(path.resolve(dataDir, "PG_VERSION"))) {
     try {
       await instance.initialise();
     } catch (error) {
-      throw toError(
-        error,
-        `Failed to initialize embedded PostgreSQL cluster in ${dataDir} on port ${selectedPort}`,
-      );
+      throw formatEmbeddedPostgresError(error, {
+        fallbackMessage:
+          `Failed to initialize embedded PostgreSQL cluster in ${dataDir} on port ${selectedPort}`,
+        recentLogs: logBuffer.getRecentLogs(),
+      });
     }
   }
   if (existsSync(postmasterPidFile)) {
@@ -157,7 +162,10 @@ async function ensureEmbeddedPostgresConnection(
   try {
     await instance.start();
   } catch (error) {
-    throw toError(error, `Failed to start embedded PostgreSQL on port ${selectedPort}`);
+    throw formatEmbeddedPostgresError(error, {
+      fallbackMessage: `Failed to start embedded PostgreSQL on port ${selectedPort}`,
+      recentLogs: logBuffer.getRecentLogs(),
+    });
   }
 
   const adminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${selectedPort}/postgres`;

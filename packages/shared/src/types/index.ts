@@ -1,7 +1,44 @@
 export type { Company } from "./company.js";
+export type { InstanceExperimentalSettings, InstanceGeneralSettings, InstanceSettings } from "./instance.js";
+export type {
+  CompanySkillSourceType,
+  CompanySkillTrustLevel,
+  CompanySkillCompatibility,
+  CompanySkillSourceBadge,
+  CompanySkillFileInventoryEntry,
+  CompanySkill,
+  CompanySkillListItem,
+  CompanySkillUsageAgent,
+  CompanySkillDetail,
+  CompanySkillUpdateStatus,
+  CompanySkillImportRequest,
+  CompanySkillImportResult,
+  CompanySkillProjectScanRequest,
+  CompanySkillProjectScanSkipped,
+  CompanySkillProjectScanConflict,
+  CompanySkillProjectScanResult,
+  CompanySkillCreateRequest,
+  CompanySkillFileDetail,
+  CompanySkillFileUpdateRequest,
+} from "./company-skill.js";
+export type {
+  AgentSkillSyncMode,
+  AgentSkillState,
+  AgentSkillOrigin,
+  AgentSkillEntry,
+  AgentSkillSnapshot,
+  AgentSkillSyncRequest,
+} from "./adapter-skills.js";
 export type {
   Agent,
+  AgentAccessState,
+  AgentChainOfCommandEntry,
+  AgentDetail,
   AgentPermissions,
+  AgentInstructionsBundleMode,
+  AgentInstructionsFileSummary,
+  AgentInstructionsFileDetail,
+  AgentInstructionsBundle,
   AgentKeyCreated,
   AgentConfigRevision,
   AdapterEnvironmentCheckLevel,
@@ -10,15 +47,31 @@ export type {
   AdapterEnvironmentTestResult,
 } from "./agent.js";
 export type { AssetImage } from "./asset.js";
-export type { Project, ProjectGoalRef, ProjectWorkspace } from "./project.js";
+export type { Project, ProjectCodebase, ProjectCodebaseOrigin, ProjectGoalRef, ProjectWorkspace } from "./project.js";
 export type {
+  ExecutionWorkspace,
   WorkspaceRuntimeService,
   ExecutionWorkspaceStrategyType,
   ExecutionWorkspaceMode,
+  ExecutionWorkspaceProviderType,
+  ExecutionWorkspaceStatus,
   ExecutionWorkspaceStrategy,
   ProjectExecutionWorkspacePolicy,
+  ProjectExecutionWorkspaceDefaultMode,
   IssueExecutionWorkspaceSettings,
 } from "./workspace-runtime.js";
+export type {
+  WorkspaceOperation,
+  WorkspaceOperationPhase,
+  WorkspaceOperationStatus,
+} from "./workspace-operation.js";
+export type {
+  IssueWorkProduct,
+  IssueWorkProductType,
+  IssueWorkProductProvider,
+  IssueWorkProductStatus,
+  IssueWorkProductReviewState,
+} from "./work-product.js";
 export type {
   Issue,
   IssueAssigneeAdapterOverrides,
@@ -54,6 +107,16 @@ export type {
   CompanySecret,
   SecretProviderDescriptor,
 } from "./secrets.js";
+export type {
+  Routine,
+  RoutineTrigger,
+  RoutineRun,
+  RoutineTriggerSecretMaterial,
+  RoutineDetail,
+  RoutineRunSummary,
+  RoutineExecutionIssueOrigin,
+  RoutineListItem,
+} from "./routine.js";
 export type { CostEvent, CostSummary, CostByAgent, CostByProviderModel, CostByBiller, CostByAgentModel, CostWindowSpendRow, CostByProject } from "./cost.js";
 export type { FinanceEvent, FinanceSummary, FinanceByBiller, FinanceByKind } from "./finance.js";
 export type {
@@ -78,18 +141,31 @@ export type {
 export type { QuotaWindow, ProviderQuotaResult } from "./quota.js";
 export type {
   CompanyPortabilityInclude,
-  CompanyPortabilitySecretRequirement,
+  CompanyPortabilityEnvInput,
+  CompanyPortabilityFileEntry,
   CompanyPortabilityCompanyManifestEntry,
+  CompanyPortabilitySidebarOrder,
   CompanyPortabilityAgentManifestEntry,
+  CompanyPortabilitySkillManifestEntry,
+  CompanyPortabilityProjectManifestEntry,
+  CompanyPortabilityProjectWorkspaceManifestEntry,
+  CompanyPortabilityIssueRoutineTriggerManifestEntry,
+  CompanyPortabilityIssueRoutineManifestEntry,
+  CompanyPortabilityIssueManifestEntry,
   CompanyPortabilityManifest,
   CompanyPortabilityExportResult,
+  CompanyPortabilityExportPreviewFile,
+  CompanyPortabilityExportPreviewResult,
   CompanyPortabilitySource,
   CompanyPortabilityImportTarget,
   CompanyPortabilityAgentSelection,
   CompanyPortabilityCollisionStrategy,
   CompanyPortabilityPreviewRequest,
   CompanyPortabilityPreviewAgentPlan,
+  CompanyPortabilityPreviewProjectPlan,
+  CompanyPortabilityPreviewIssuePlan,
   CompanyPortabilityPreviewResult,
+  CompanyPortabilityAdapterOverride,
   CompanyPortabilityImportRequest,
   CompanyPortabilityImportResult,
   CompanyPortabilityExportRequest,
