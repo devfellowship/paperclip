@@ -520,6 +520,7 @@ export async function startServer(): Promise<StartedServer> {
   const feedback = feedbackService(db as any, {
     shareClient: createFeedbackTraceShareClientFromConfig(config),
   });
+  const heartbeat = heartbeatService(db as any);
   const app = await createApp(db as any, {
     uiMode,
     serverPort: listenPort,
@@ -533,6 +534,7 @@ export async function startServer(): Promise<StartedServer> {
     companyDeletionEnabled: config.companyDeletionEnabled,
     betterAuthHandler,
     resolveSession,
+    heartbeat,
   });
   const server = createServer(app as unknown as Parameters<typeof createServer>[0]);
 
@@ -574,7 +576,6 @@ export async function startServer(): Promise<StartedServer> {
     });
   
   if (config.heartbeatSchedulerEnabled) {
-    const heartbeat = heartbeatService(db as any);
     const routines = routineService(db as any);
   
     // Reap orphaned running runs at startup while in-memory execution state is empty,
