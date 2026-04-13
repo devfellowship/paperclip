@@ -39,6 +39,7 @@ import {
   instanceSettingsService,
   issueApprovalService,
   issueService,
+  blockerService,
   documentService,
   logActivity,
   projectService,
@@ -290,6 +291,7 @@ export function issueRoutes(
   const workProductsSvc = workProductService(db);
   const documentsSvc = documentService(db);
   const routinesSvc = routineService(db);
+  const blockersSvc = blockerService(db);
   const feedbackExportService = opts?.feedbackExportService;
   const upload = multer({
     storage: multer.memoryStorage(),
@@ -1632,6 +1634,13 @@ export function issueRoutes(
           trackAgentTaskCompleted(tc, { agentRole: actorAgent.role });
         }
       }
+    }
+
+    // Auto-resolve blocker notifications when a task transitions out of "blocked"
+    if (existing.status === "blocked" && issue.status !== "blocked") {
+      void blockersSvc.resolveByTaskId(issue.id).catch((err) =>
+        logger.warn({ err, issueId: issue.id }, "failed to auto-resolve blocker notifications"),
+      );
     }
 
     let comment = null;
