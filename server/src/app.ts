@@ -33,6 +33,7 @@ import { pluginRoutes } from "./routes/plugins.js";
 import { adapterRoutes } from "./routes/adapters.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
 import { webhooksGithubRoutes } from "./routes/webhooks-github.js";
+import { blockerRoutes } from "./routes/blockers.js";
 import type { heartbeatService } from "./services/heartbeat.js";
 import { applyUiBranding } from "./ui-branding.js";
 import { logger } from "./middleware/logger.js";
@@ -172,6 +173,7 @@ export async function createApp(
   api.use(sidebarBadgeRoutes(db));
   api.use(inboxDismissalRoutes(db));
   api.use(instanceSettingsRoutes(db));
+  api.use(blockerRoutes(db));
   const hostServicesDisposers = new Map<string, () => void>();
   const workerManager = createPluginWorkerManager();
   const pluginRegistry = pluginRegistryService(db);
