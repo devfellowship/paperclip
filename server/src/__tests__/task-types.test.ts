@@ -293,3 +293,93 @@ describe("validateCompletionReport / multi-repo-rollout", () => {
     expect(res.ok).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// checkRequiredCredentials (DEV-251)
+// ---------------------------------------------------------------------------
+
+import {
+  checkRequiredCredentials,
+  TASK_TYPE_REQUIRED_CREDENTIALS,
+} from "../services/task-types.ts";
+
+describe("checkRequiredCredentials", () => {
+  it("passes when agent has GITHUB_PAT env key for single-repo-implementation", () => {
+    const result = checkRequiredCredentials(
+      "single-repo-implementation",
+      ["GITHUB_PAT_BRO", "INFISICAL_CLIENT_ID", "INFISICAL_CLIENT_SECRET"],
+    );
+    expect(result.ok).toBe(true);
+    expect(result.missing).toHaveLength(0);
+  });
+
+  it("fails when agent has no GitHub PAT for single-repo-implementation", () => {
+    const result = checkRequiredCredentials(
+      "single-repo-implementation",
+      ["INFISICAL_CLIENT_ID", "INFISICAL_CLIENT_SECRET", "NPM_TOKEN"],
+    );
+    expect(result.ok).toBe(false);
+    expect(result.missing).toContain("GITHUB_PAT_WITH_CONTENTS_WRITE");
+  });
+
+  it("passes for single-repo-spec with empty env (no credentials required)", () => {
+    const result = checkRequiredCredentials("single-repo-spec", []);
+    expect(result.ok).toBe(true);
+  });
+
+  it("passes for single-repo-verification with empty env (no credentials required)", () => {
+    const result = checkRequiredCredentials("single-repo-verification", []);
+    expect(result.ok).toBe(true);
+  });
+
+  it("fails for multi-repo-rollout without GitHub PAT", () => {
+    const result = checkRequiredCredentials("multi-repo-rollout", ["SUPABASE_SERVICE_ROLE_KEY"]);
+    expect(result.ok).toBe(false);
+    expect(result.missing).toContain("GITHUB_PAT_WITH_CONTENTS_WRITE");
+  });
+
+  it("passes for multi-repo-rollout with GH_TOKEN", () => {
+    const result = checkRequiredCredentials("multi-repo-rollout", ["GH_TOKEN"]);
+    expect(result.ok).toBe(true);
+  });
+
+  it("passes for unknown task type (legacy tasks bypass)", () => {
+    const result = checkRequiredCredentials("legacy-unknown-type", ["some-key"]);
+    expect(result.ok).toBe(true);
+  });
+
+  it("passes for null task type (untyped task)", () => {
+    const result = checkRequiredCredentials(null, []);
+    expect(result.ok).toBe(true);
+  });
+
+  it("uses per-task override when provided", () => {
+    // Override to require SUPABASE_SERVICE_ROLE for an otherwise low-req type
+    const result = checkRequiredCredentials(
+      "single-repo-spec",
+      ["INFISICAL_CLIENT_ID"],
+      ["SUPABASE_SERVICE_ROLE"],
+    );
+    expect(result.ok).toBe(false);
+    expect(result.missing).toContain("SUPABASE_SERVICE_ROLE");
+  });
+
+  it("per-task override with empty array falls back to type defaults", () => {
+    // Empty override should not override — falls back to type defaults
+    const result = checkRequiredCredentials(
+      "single-repo-implementation",
+      ["INFISICAL_CLIENT_ID"],
+      [],
+    );
+    // Empty array = no override, type defaults apply
+    expect(result.ok).toBe(false);
+  });
+
+  it("GH_PAT prefix matches GITHUB_PAT_WITH_CONTENTS_WRITE capability", () => {
+    const result = checkRequiredCredentials(
+      "single-repo-implementation",
+      ["GH_PAT_DEV"],
+    );
+    expect(result.ok).toBe(true);
+  });
+});

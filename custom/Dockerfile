@@ -122,5 +122,21 @@ RUN cd /app/server && npx tsc 2>&1 || true \
     && grep -q "invokeMultiGitter" /app/server/dist/services/multi-gitter.js \
     && echo "✓ multi-gitter.ts compiled into dist/services/multi-gitter.js"
 
+# ─── PATCH 7.1: Credential guard (DEV-251 Harness v2 WS-4) ───────────────────
+# At checkout time, if the issue has a task_type, the server pre-checks that
+# the assignee agent's adapterConfig.env contains all required credential keys.
+# Missing creds → issue auto-transitions to "blocked" + Telegram via blockersSvc.
+#
+# Adds:
+#   - required_credentials per TaskType to server/src/services/task-types.ts
+#   - checkRequiredCredentials() helper in task-types.ts
+#   - patch-credentials.cjs injects the guard into POST /issues/:id/checkout
+COPY patches/patch-credentials.cjs /tmp/patch-credentials.cjs
+RUN node /tmp/patch-credentials.cjs \
+    && cd /app/server && npx tsc 2>&1 || true \
+    && grep -q "checkRequiredCredentials" /app/server/dist/routes/issues.js \
+    && grep -q "CREDENTIAL_CAPABILITIES" /app/server/dist/services/task-types.js \
+    && echo "✓ credential guard injected into checkout route and compiled"
+
 # Note: no `USER node` — the entrypoint needs root to remap UID/GID then drops
 # to node via gosu. Matches the base paperclip:latest image (v2026.403.0+).

@@ -6,6 +6,8 @@
  *
  * Spec: https://plans.tainanfidelis.com/20260411-harness-v2-task-type-taxonomy
  * Implementation issue: DEV-167
+ *
+ * DEV-251: required_credentials per task type + checkRequiredCredentials()
  */
 
 // ---------------------------------------------------------------------------
@@ -23,6 +25,112 @@ export type TaskType = (typeof TASK_TYPES)[number];
 
 export function isTaskType(value: unknown): value is TaskType {
   return typeof value === "string" && TASK_TYPES.includes(value as TaskType);
+}
+
+// ---------------------------------------------------------------------------
+// Credential capabilities (DEV-251)
+//
+// Canonical capability names map to regex patterns that match known env var
+// keys in the agent's adapterConfig.env.  A task type that requires a
+// capability passes the check if the agent has at least one env key matching
+// any of the capability's patterns.
+// ---------------------------------------------------------------------------
+
+export interface CredentialCapability {
+  /** Human-readable description shown in blocked-issue comments. */
+  description: string;
+  /**
+   * One or more regex patterns to test against the agent's adapterConfig.env
+   * keys.  At least one key must match for the credential to be considered
+   * present.
+   */
+  envPatterns: RegExp[];
+}
+
+export const CREDENTIAL_CAPABILITIES: Record<string, CredentialCapability> = {
+  GITHUB_PAT_WITH_CONTENTS_WRITE: {
+    description: "GitHub Personal Access Token with contents:write scope",
+    envPatterns: [/^GITHUB_PAT/i, /^GH_PAT/i, /^GH_TOKEN$/i],
+  },
+  SUPABASE_SERVICE_ROLE: {
+    description: "Supabase service-role key",
+    envPatterns: [/^SUPABASE_SERVICE_ROLE/i, /^SUPABASE_KEY/i],
+  },
+  INFISICAL_MACHINE_IDENTITY: {
+    description: "Infisical machine identity (INFISICAL_CLIENT_ID + INFISICAL_CLIENT_SECRET)",
+    envPatterns: [/^INFISICAL_CLIENT_ID$/i],
+  },
+  NPM_TOKEN: {
+    description: "npm publish token",
+    envPatterns: [/^NPM_TOKEN/i],
+  },
+};
+
+/**
+ * Required credential capabilities per task type.
+ *
+ * Per-task overrides can be provided in task_body.required_credentials (an
+ * array of capability names). When present, the per-task list is used instead
+ * of (not in addition to) the type-level defaults.
+ */
+export const TASK_TYPE_REQUIRED_CREDENTIALS: Record<TaskType, string[]> = {
+  "single-repo-implementation": ["GITHUB_PAT_WITH_CONTENTS_WRITE"],
+  "single-repo-spec": [],
+  "single-repo-verification": [],
+  "multi-repo-rollout": ["GITHUB_PAT_WITH_CONTENTS_WRITE"],
+};
+
+export interface CredentialCheckResult {
+  ok: boolean;
+  /** Capability names that are missing from the agent's env config. */
+  missing: string[];
+}
+
+/**
+ * Check whether the agent's declared env keys satisfy all required credentials
+ * for the given task type (or per-task override list).
+ *
+ * @param taskType          The task's task_type value (may be null/undefined for untyped tasks).
+ * @param agentEnvKeys      Keys from the assignee agent's adapterConfig.env object.
+ * @param requiredOverride  Optional per-task required_credentials override from task_body.
+ */
+export function checkRequiredCredentials(
+  taskType: TaskType | string | null | undefined,
+  agentEnvKeys: string[],
+  requiredOverride?: string[] | null,
+): CredentialCheckResult {
+  // No task type → no credential requirements (legacy tasks pass through)
+  if (!taskType || !isTaskType(taskType)) {
+    return { ok: true, missing: [] };
+  }
+
+  const required =
+    Array.isArray(requiredOverride) && requiredOverride.length > 0
+      ? requiredOverride
+      : TASK_TYPE_REQUIRED_CREDENTIALS[taskType];
+
+  if (!required || required.length === 0) {
+    return { ok: true, missing: [] };
+  }
+
+  const missing: string[] = [];
+
+  for (const capabilityName of required) {
+    const capability = CREDENTIAL_CAPABILITIES[capabilityName];
+    if (!capability) {
+      // Unknown capability name — treat as missing (conservative)
+      missing.push(capabilityName);
+      continue;
+    }
+    const found = agentEnvKeys.some((key) =>
+      capability.envPatterns.some((pattern) => pattern.test(key)),
+    );
+    if (!found) {
+      missing.push(capabilityName);
+    }
+  }
+
+  return { ok: missing.length === 0, missing };
 }
 
 // ---------------------------------------------------------------------------
