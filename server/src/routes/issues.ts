@@ -2027,6 +2027,74 @@ export function issueRoutes(
     res.json(released);
   });
 
+  // DEV-255 — Heartbeat-on-demand API
+  // POST /issues/:id/heartbeat — triggers an immediate wakeup for the issue's assignee.
+  // Idempotent: calls within a short window with the same issueId coalesce via idempotencyKey.
+  // Returns { assigned: true, agentId, runId } or { assigned: false, reason }.
+  router.post("/issues/:id/heartbeat", async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await svc.getById(id);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, issue.companyId);
+
+    if (!issue.assigneeAgentId) {
+      res.status(200).json({ assigned: false, reason: "no_assignee" });
+      return;
+    }
+
+    if (issue.status === "done" || issue.status === "cancelled") {
+      res.status(200).json({ assigned: false, reason: "issue_closed" });
+      return;
+    }
+
+    const actor = getActorInfo(req);
+
+    // Idempotency key: one wakeup per issue per minute to prevent flooding
+    const idempotencyKey = `heartbeat-on-demand:${issue.id}:${Math.floor(Date.now() / 60_000)}`;
+
+    const run = await heartbeat
+      .wakeup(issue.assigneeAgentId, {
+        source: "on_demand",
+        triggerDetail: "manual",
+        reason: "heartbeat_on_demand",
+        payload: { issueId: issue.id, mutation: "heartbeat_requested" },
+        idempotencyKey,
+        requestedByActorType: actor.actorType,
+        requestedByActorId: actor.actorId,
+        contextSnapshot: { issueId: issue.id, source: "issue.heartbeat" },
+      })
+      .catch((err) => {
+        logger.warn({ err, issueId: issue.id }, "heartbeat-on-demand: wakeup failed");
+        return null;
+      });
+
+    if (!run) {
+      res.status(200).json({ assigned: false, reason: "already_running_or_queued" });
+      return;
+    }
+
+    await logActivity(db, {
+      companyId: issue.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "heartbeat.invoked",
+      entityType: "heartbeat_run",
+      entityId: (run as { id: string }).id,
+      details: { issueId: issue.id, source: "heartbeat_on_demand" },
+    });
+
+    res.status(200).json({
+      assigned: true,
+      agentId: issue.assigneeAgentId,
+      runId: (run as { id: string }).id,
+    });
+  });
+
   router.get("/issues/:id/comments", async (req, res) => {
     const id = req.params.id as string;
     const issue = await svc.getById(id);
@@ -2627,6 +2695,77 @@ export function issueRoutes(
     });
 
     res.json({ ok: true });
+  });
+
+  // DEV-255 — Company-scoped heartbeat-on-demand alias
+  // POST /companies/:companyId/issues/:issueId/heartbeat
+  // Same semantics as POST /issues/:id/heartbeat but with explicit company scoping.
+  router.post("/companies/:companyId/issues/:issueId/heartbeat", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    const issueId = req.params.issueId as string;
+    assertCompanyAccess(req, companyId);
+
+    const issue = await svc.getById(issueId);
+    if (!issue) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    if (issue.companyId !== companyId) {
+      res.status(422).json({ error: "Issue does not belong to company" });
+      return;
+    }
+
+    if (!issue.assigneeAgentId) {
+      res.status(200).json({ assigned: false, reason: "no_assignee" });
+      return;
+    }
+
+    if (issue.status === "done" || issue.status === "cancelled") {
+      res.status(200).json({ assigned: false, reason: "issue_closed" });
+      return;
+    }
+
+    const actor = getActorInfo(req);
+    const idempotencyKey = `heartbeat-on-demand:${issue.id}:${Math.floor(Date.now() / 60_000)}`;
+
+    const run = await heartbeat
+      .wakeup(issue.assigneeAgentId, {
+        source: "on_demand",
+        triggerDetail: "manual",
+        reason: "heartbeat_on_demand",
+        payload: { issueId: issue.id, mutation: "heartbeat_requested" },
+        idempotencyKey,
+        requestedByActorType: actor.actorType,
+        requestedByActorId: actor.actorId,
+        contextSnapshot: { issueId: issue.id, source: "issue.heartbeat" },
+      })
+      .catch((err) => {
+        logger.warn({ err, issueId: issue.id }, "heartbeat-on-demand (company): wakeup failed");
+        return null;
+      });
+
+    if (!run) {
+      res.status(200).json({ assigned: false, reason: "already_running_or_queued" });
+      return;
+    }
+
+    await logActivity(db, {
+      companyId: issue.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "heartbeat.invoked",
+      entityType: "heartbeat_run",
+      entityId: (run as { id: string }).id,
+      details: { issueId: issue.id, source: "heartbeat_on_demand" },
+    });
+
+    res.status(200).json({
+      assigned: true,
+      agentId: issue.assigneeAgentId,
+      runId: (run as { id: string }).id,
+    });
   });
 
   return router;
