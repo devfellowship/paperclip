@@ -102,10 +102,10 @@ RUN node /tmp/patch-guards.cjs \
 # Used by the multi-repo-rollout task type executed by dfl-rollout-ops.
 # Pinned version for reproducibility — bump deliberately.
 # Source: https://github.com/lindell/multi-gitter
-ARG MULTI_GITTER_VERSION=0.54.0
-RUN ARCH=$(dpkg --print-architecture | sed 's/amd64/x86_64/;s/arm64/arm64/') \
+ARG MULTI_GITTER_VERSION=0.63.0
+RUN ARCH=$(dpkg --print-architecture | sed 's/amd64/x86_64/;s/arm64/ARM64/') \
     && curl -fsSL -o /tmp/multi-gitter.tar.gz \
-       "https://github.com/lindell/multi-gitter/releases/download/v${MULTI_GITTER_VERSION}/multi-gitter_Linux_${ARCH}.tar.gz" \
+       "https://github.com/lindell/multi-gitter/releases/download/v${MULTI_GITTER_VERSION}/multi-gitter_${MULTI_GITTER_VERSION}_Linux_${ARCH}.tar.gz" \
     && tar -xzf /tmp/multi-gitter.tar.gz -C /usr/local/bin multi-gitter \
     && rm /tmp/multi-gitter.tar.gz \
     && chmod +x /usr/local/bin/multi-gitter \
