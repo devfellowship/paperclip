@@ -53,6 +53,10 @@ export const issues = pgTable(
       .references((): AnyPgColumn => executionWorkspaces.id, { onDelete: "set null" }),
     executionWorkspacePreference: text("execution_workspace_preference"),
     executionWorkspaceSettings: jsonb("execution_workspace_settings").$type<Record<string, unknown>>(),
+    // Task type taxonomy (Harness v2 Fase 1, DEV-167)
+    taskType: text("task_type"),
+    taskBody: jsonb("task_body").$type<Record<string, unknown>>(),
+    completionReport: jsonb("completion_report").$type<Record<string, unknown>>(),
     githubRepo: text("github_repo"),
     githubPrNumber: integer("github_pr_number"),
     startedAt: timestamp("started_at", { withTimezone: true }),
