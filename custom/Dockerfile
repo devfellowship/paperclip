@@ -59,15 +59,10 @@ RUN sed -i 's|coalesce(sum(${costEvents.costCents}), 0)::int|coalesce(sum(${cost
     && grep -q "equivalent_api_cost_cents" /app/server/dist/services/dashboard.js \
     && echo "✓ dashboard.js patched to include equivalent_api_cost_cents"
 
-# PATCH UI: Inbox badge counts only unread touched issues (not all touched).
-# Upstream commit 21d2b075 moved badge calc client-side and started counting
-# every touched issue (including done) — we want unread-only.
-# This requires recompiling the UI bundle since output is content-hashed.
-COPY patches/inbox.ts /app/ui/src/lib/inbox.ts
-RUN cd /app/ui && rm -rf dist && npx vite build > /tmp/vite-build.log 2>&1 \
-    && tail -5 /tmp/vite-build.log \
-    && test -d /app/ui/dist/assets \
-    && echo "✓ ui rebuilt with inbox badge patch"
+# NOTE: Inbox badge patch REMOVED — upstream now uses issue.isUnreadForMe
+# (same intent as our getUnreadTouchedIssues patch). Our patches/inbox.ts is
+# stale (older upstream baseline) and overwriting the newer file breaks vite
+# build. No UI rebuild needed; upstream already has the desired behavior.
 
 # ─── PATCH 5.1: Deterministic guards (DEV-164 Harness v2 Fase 3) ─────────────
 # Adds server/src/services/guards.ts which implements guard checks for
