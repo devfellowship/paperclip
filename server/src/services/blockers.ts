@@ -7,6 +7,17 @@ import { logger } from "../middleware/logger.js";
 
 const DEDUP_WINDOW_MS = 60 * 60 * 1000; // 1 hour
 
+/** Convert BigInt fields to Number for JSON serialization */
+function toJsonSafe<T extends Record<string, unknown>>(row: T): T {
+  const result = { ...row };
+  for (const [key, value] of Object.entries(result)) {
+    if (typeof value === "bigint") {
+      (result as Record<string, unknown>)[key] = Number(value);
+    }
+  }
+  return result;
+}
+
 function computeBlockerHash(taskId: string, needs: string): string {
   return createHash("sha256").update(`${taskId}|${needs}`).digest("hex");
 }
@@ -113,7 +124,7 @@ export function blockerService(db: Db) {
         return {
           ok: true,
           posted: false,
-          notification: existing,
+          notification: toJsonSafe(existing),
           duplicateOf: existing.id,
         };
       }
@@ -174,7 +185,7 @@ export function blockerService(db: Db) {
       return {
         ok: true,
         posted: true,
-        notification,
+        notification: toJsonSafe(notification),
         telegramUrl,
       };
     },
@@ -188,7 +199,7 @@ export function blockerService(db: Db) {
       if (!existing) return null;
 
       if (existing.resolvedAt) {
-        return { notification: existing, alreadyResolved: true };
+        return { notification: toJsonSafe(existing), alreadyResolved: true };
       }
 
       // Edit Telegram message to resolved
@@ -208,7 +219,7 @@ export function blockerService(db: Db) {
         .where(eq(blockerNotifications.id, notificationId))
         .returning();
 
-      return { notification: updated, alreadyResolved: false };
+      return { notification: toJsonSafe(updated), alreadyResolved: false };
     },
 
     async resolveByTaskId(taskId: string) {
