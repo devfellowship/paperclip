@@ -406,7 +406,7 @@ function validateCommandRun(
     return;
   }
   const r = val as Record<string, unknown>;
-  requireString(r, "name", 1, errors.map ? errors : errors);
+  requireString(r, "name", 1, errors);
   requireString(r, "command", 1, errors);
   if (typeof r["exit_code"] !== "number" || !Number.isInteger(r["exit_code"])) {
     errors.push({ field: `${prefix}.exit_code`, message: "Must be an integer" });
