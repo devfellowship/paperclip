@@ -68,5 +68,34 @@ RUN cd /app/ui && rm -rf dist && npx vite build > /tmp/vite-build.log 2>&1 \
     && tail -5 /tmp/vite-build.log \
     && test -d /app/ui/dist/assets \
     && echo "✓ ui rebuilt with inbox badge patch"
+
+# ─── PATCH 5.1: Deterministic guards (DEV-164 Harness v2 Fase 3) ─────────────
+# Adds server/src/services/guards.ts which implements guard checks for
+# agent status transitions:
+#   in_progress → in_review : requireValidationEvidence, requireOutputSchema,
+#                              requirePRUrl, requireRepoCoverage (stub)
+#   in_review   → done      : requireValidationEvidence, requireOutputSchema
+#
+# When a guard fails:
+#   - The requested status is overridden to "blocked" (auto-transition)
+#   - blockerService.create() fires a Telegram notification to #1304
+#   - The PATCH response returns the blocked issue so the agent can react
+#
+# Source: plans/20260411-harness-reliability-program-v2 (Fase 3)
+# Depends on: DEV-161 (blockerService, already in fork/master)
+COPY patches/guards.ts /app/server/src/services/guards.ts
+
+# PATCH 5.2: Inject runGuards into the PATCH /issues/:id route handler.
+# patch-guards.js surgically patches routes/issues.ts:
+#   1. Adds `import { runGuards } from "../services/guards.js";`
+#   2. Inserts a guard block before `let issue;` in the route body
+# Then recompiles the full server with tsc.
+COPY patches/patch-guards.cjs /tmp/patch-guards.cjs
+RUN node /tmp/patch-guards.cjs \
+    && cd /app/server && npx tsc 2>&1 || true \
+    && grep -q "runGuards" /app/server/dist/routes/issues.js \
+    && grep -q "runGuards" /app/server/dist/services/guards.js \
+    && echo "✓ guards.ts compiled into dist/services/guards.js and wired into routes/issues.js"
+
 # Note: no `USER node` — the entrypoint needs root to remap UID/GID then drops
 # to node via gosu. Matches the base paperclip:latest image (v2026.403.0+).
