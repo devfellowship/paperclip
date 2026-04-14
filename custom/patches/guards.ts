@@ -1,5 +1,6 @@
 // server/src/services/guards.ts
 // DEV-164 — Harness v2 Fase 3: Deterministic guards
+// DEV-165 — requireRepoCoverage implemented (multi-repo rollout support)
 // Injected via paperclip:custom Dockerfile PATCH 5.1
 // Called from routes/issues.ts PATCH /issues/:id before svc.update()
 //
@@ -84,11 +85,65 @@ function requirePRUrl(comment: string): GuardResult {
 
 /**
  * requireRepoCoverage
- * Stub — always passes. Will be enhanced when multi-repo task types are defined.
+ * For multi-repo-rollout tasks: validates that the completion report's
+ * coverage is complete — i.e. no repo silently dropped.
+ *
+ * Rule (DEV-165):
+ *   len(repos_succeeded) + len(repos_failed) == len(repos_targeted)
+ *
+ * The guard looks for a JSON block tagged with "multi-repo-report:" in the
+ * transition comment.  If no such block is present (non-rollout task types),
+ * the guard passes without action.
+ *
  * Applies to: in_progress → in_review
  */
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-function requireRepoCoverage(_comment: string): GuardResult {
+function requireRepoCoverage(comment: string): GuardResult {
+  // Extract JSON report from comment — agents embed it as:
+  //   multi-repo-report: { "repos_targeted": [...], "repos_succeeded": [...], "repos_failed": [...], ... }
+  const match = comment.match(/multi-repo-report:\s*(\{[\s\S]*?\}(?=\s*\n|$))/m);
+  if (!match) {
+    // No embedded report — this is not a multi-repo-rollout task; pass.
+    return { ok: true };
+  }
+
+  let report: Record<string, unknown>;
+  try {
+    report = JSON.parse(match[1]);
+  } catch {
+    return {
+      ok: false,
+      reason:
+        "requireRepoCoverage: multi-repo-report block found but JSON is invalid. " +
+        "Ensure the report is a valid JSON object.",
+      escalate: "block",
+    };
+  }
+
+  const targeted = Array.isArray(report["repos_targeted"]) ? report["repos_targeted"] as unknown[] : null;
+  const succeeded = Array.isArray(report["repos_succeeded"]) ? report["repos_succeeded"] as unknown[] : null;
+  const failed = Array.isArray(report["repos_failed"]) ? report["repos_failed"] as unknown[] : null;
+
+  if (!targeted || !succeeded || !failed) {
+    return {
+      ok: false,
+      reason:
+        "requireRepoCoverage: multi-repo-report must include repos_targeted, repos_succeeded, and repos_failed arrays.",
+      escalate: "block",
+    };
+  }
+
+  const accountedFor = succeeded.length + failed.length;
+  if (accountedFor !== targeted.length) {
+    return {
+      ok: false,
+      reason:
+        `requireRepoCoverage: coverage gap detected. ` +
+        `targeted=${targeted.length}, succeeded=${succeeded.length}, failed=${failed.length} ` +
+        `(succeeded + failed must equal targeted — no silent drops allowed).`,
+      escalate: "block",
+    };
+  }
+
   return { ok: true };
 }
 

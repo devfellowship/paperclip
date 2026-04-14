@@ -73,16 +73,21 @@ RUN cd /app/ui && rm -rf dist && npx vite build > /tmp/vite-build.log 2>&1 \
 # Adds server/src/services/guards.ts which implements guard checks for
 # agent status transitions:
 #   in_progress → in_review : requireValidationEvidence, requireOutputSchema,
-#                              requirePRUrl, requireRepoCoverage (stub)
+#                              requirePRUrl, requireRepoCoverage
 #   in_review   → done      : requireValidationEvidence, requireOutputSchema
+#
+# requireRepoCoverage is now FULLY IMPLEMENTED (DEV-165):
+#   - Parses "multi-repo-report: {...}" JSON block from transition comment
+#   - Validates len(repos_succeeded) + len(repos_failed) == len(repos_targeted)
+#   - Blocks with Telegram alert on coverage gap (no silent drops)
 #
 # When a guard fails:
 #   - The requested status is overridden to "blocked" (auto-transition)
 #   - blockerService.create() fires a Telegram notification to #1304
 #   - The PATCH response returns the blocked issue so the agent can react
 #
-# Source: plans/20260411-harness-reliability-program-v2 (Fase 3)
-# Depends on: DEV-161 (blockerService, already in fork/master)
+# Source: plans/20260411-harness-reliability-program-v2 (Fase 3 + 4)
+# Depends on: DEV-161 (blockerService), DEV-164 (guards wiring), DEV-165 (this)
 COPY patches/guards.ts /app/server/src/services/guards.ts
 
 # PATCH 5.2: Inject runGuards into the PATCH /issues/:id route handler.
@@ -96,6 +101,31 @@ RUN node /tmp/patch-guards.cjs \
     && grep -q "runGuards" /app/server/dist/routes/issues.js \
     && grep -q "runGuards" /app/server/dist/services/guards.js \
     && echo "✓ guards.ts compiled into dist/services/guards.js and wired into routes/issues.js"
+
+# ─── PATCH 6.1: multi-gitter CLI (DEV-165 Harness v2 Fase 4) ──────────────────
+# Installs multi-gitter, the fleet-wide PR automation tool.
+# Used by the multi-repo-rollout task type executed by dfl-rollout-ops.
+# Pinned version for reproducibility — bump deliberately.
+# Source: https://github.com/lindell/multi-gitter
+ARG MULTI_GITTER_VERSION=0.54.0
+RUN ARCH=$(dpkg --print-architecture | sed 's/amd64/x86_64/;s/arm64/arm64/') \
+    && curl -fsSL -o /tmp/multi-gitter.tar.gz \
+       "https://github.com/lindell/multi-gitter/releases/download/v${MULTI_GITTER_VERSION}/multi-gitter_Linux_${ARCH}.tar.gz" \
+    && tar -xzf /tmp/multi-gitter.tar.gz -C /usr/local/bin multi-gitter \
+    && rm /tmp/multi-gitter.tar.gz \
+    && chmod +x /usr/local/bin/multi-gitter \
+    && multi-gitter version \
+    && echo "✓ multi-gitter ${MULTI_GITTER_VERSION} installed"
+
+# PATCH 6.2: multi-gitter adapter service
+# Copies server/src/services/multi-gitter.ts into the compiled server and
+# recompiles with tsc so it becomes importable by dfl-rollout-ops via the
+# Paperclip skill layer.
+COPY patches/multi-gitter.ts /app/server/src/services/multi-gitter.ts
+RUN cd /app/server && npx tsc 2>&1 || true \
+    && test -f /app/server/dist/services/multi-gitter.js \
+    && grep -q "invokeMultiGitter" /app/server/dist/services/multi-gitter.js \
+    && echo "✓ multi-gitter.ts compiled into dist/services/multi-gitter.js"
 
 # Note: no `USER node` — the entrypoint needs root to remap UID/GID then drops
 # to node via gosu. Matches the base paperclip:latest image (v2026.403.0+).
