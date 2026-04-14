@@ -1,9 +1,10 @@
 import crypto from "node:crypto";
 import { Router } from "express";
-import { and, asc, eq, gte, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agents, issueComments, issues } from "@paperclipai/db";
+import { agents, issueComments, issues, webhookEvents } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
+import { assertCompanyAccess } from "./authz.js";
 import type { heartbeatService } from "../services/heartbeat.js";
 
 type HeartbeatService = ReturnType<typeof heartbeatService>;
@@ -130,6 +131,48 @@ export function webhooksGithubRoutes(db: Db, heartbeat: HeartbeatService): Route
       res.status(204).end();
       return;
     }
+
+    // DEV-261: persist all workflow_run events for audit/verification
+    // Stored before processing so even rejected events are logged.
+    const persistedEventId = await (async () => {
+      try {
+        const rawPayload = req.body as Record<string, unknown>;
+        const repoName = (rawPayload?.repository as Record<string, unknown> | null)?.full_name as string | undefined;
+        const wfRun = rawPayload?.workflow_run as Record<string, unknown> | null;
+        const prList = wfRun?.pull_requests as Array<Record<string, unknown>> | undefined;
+
+        // Find companyId via githubRepo → issues (best-effort; may be null for new repos)
+        const matchedCompany = repoName
+          ? await db
+              .select({ companyId: issues.companyId })
+              .from(issues)
+              .where(eq(issues.githubRepo, repoName))
+              .then((rows) => rows[0]?.companyId ?? null)
+          : null;
+
+        if (!matchedCompany) return null; // Can't associate without a company
+
+        const [inserted] = await db
+          .insert(webhookEvents)
+          .values({
+            companyId: matchedCompany,
+            source: "github",
+            eventType: event ?? "unknown",
+            repo: repoName ?? null,
+            prNumber: (prList?.[0]?.number as number | undefined) ?? null,
+            runId: wfRun?.id != null ? BigInt(wfRun.id as number) : null,
+            action: rawPayload?.action as string | undefined ?? null,
+            conclusion: wfRun?.conclusion as string | undefined ?? null,
+            payload: rawPayload,
+          })
+          .returning({ id: webhookEvents.id });
+        return inserted?.id ?? null;
+      } catch (err) {
+        logger.warn({ err }, "webhooks-github: failed to persist webhook event");
+        return null;
+      }
+    })();
+    void persistedEventId; // used for logging; not required for response flow
 
     const payload = req.body as {
       action?: string;
@@ -319,6 +362,54 @@ export function webhooksGithubRoutes(db: Db, heartbeat: HeartbeatService): Route
     );
 
     res.status(200).json({ ok: true, reverted, rateLimited });
+  });
+
+  // DEV-261 — GET /companies/:companyId/webhook-events
+  // Query recent inbound webhook events for audit and verification.
+  // Params: ?source=github&repo=org/repo&since=ISO8601&limit=50
+  router.get("/companies/:companyId/webhook-events", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+
+    const source = typeof req.query.source === "string" ? req.query.source : undefined;
+    const repo   = typeof req.query.repo   === "string" ? req.query.repo   : undefined;
+    const since  = typeof req.query.since  === "string" ? new Date(req.query.since) : undefined;
+    const limitRaw = parseInt(String(req.query.limit ?? "50"), 10);
+    const limit  = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 200) : 50;
+
+    if (since && isNaN(since.getTime())) {
+      res.status(400).json({ error: "Invalid since parameter (must be ISO 8601)" });
+      return;
+    }
+
+    const conditions = [eq(webhookEvents.companyId, companyId)];
+    if (source)  conditions.push(eq(webhookEvents.source, source));
+    if (repo)    conditions.push(eq(webhookEvents.repo, repo));
+    if (since)   conditions.push(gte(webhookEvents.receivedAt, since));
+
+    const rows = await db
+      .select({
+        id:         webhookEvents.id,
+        source:     webhookEvents.source,
+        eventType:  webhookEvents.eventType,
+        repo:       webhookEvents.repo,
+        prNumber:   webhookEvents.prNumber,
+        runId:      webhookEvents.runId,
+        action:     webhookEvents.action,
+        conclusion: webhookEvents.conclusion,
+        receivedAt: webhookEvents.receivedAt,
+      })
+      .from(webhookEvents)
+      .where(and(...conditions))
+      .orderBy(desc(webhookEvents.receivedAt))
+      .limit(limit);
+
+    res.json({
+      events: rows.map((r) => ({
+        ...r,
+        runId: r.runId != null ? Number(r.runId) : null,
+      })),
+    });
   });
 
   return router;
