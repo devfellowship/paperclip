@@ -41,14 +41,33 @@ RUN apt-get update -qq && apt-get install -y --no-install-recommends curl ca-cer
 #   - PATCH 1.3: exponential backoff on consecutive no-work runs
 # Source: plans/20260407-paperclip-cost-optimizations.md
 #
-# The runtime entry point is `server/dist/index.js`, which imports from
-# `dist/services/heartbeat.js`. So we must overwrite both the .ts source AND
-# the compiled .js. Recompiling via tsc inside the image is the cleanest path.
+# ─── Paperclip source patches (all copied before single tsc compile) ─────────
+#
+# All custom .ts files are COPYd first, then compiled together in one `npx tsc`
+# pass. This avoids cross-dependency issues (e.g., heartbeat.ts imports
+# task-types.ts, so both must be present before compile).
+#
+# Files and their patch origins:
+#   heartbeat.ts  — PATCH 1.1/1.2/1.3 (cost opts) + PATCH 4.1 (equiv cost) +
+#                   PATCH 8.1 (DEV-250 mid-flight verification)
+#   guards.ts     — DEV-164 (deterministic status-transition guards)
+#   task-types.ts — DEV-167 (task type taxonomy) + DEV-251 (credential caps)
+#   issues.ts     — DEV-164 (runGuards wire-up) + DEV-251 (checkout cred guard)
 COPY patches/heartbeat.ts /app/server/src/services/heartbeat.ts
+COPY patches/guards.ts /app/server/src/services/guards.ts
+COPY patches/task-types.ts /app/server/src/services/task-types.ts
+COPY patches/issues.ts /app/server/src/routes/issues.ts
 RUN cd /app/server && npx tsc 2>&1 || true \
     && grep -q "skippedNoWork" /app/server/dist/services/heartbeat.js \
     && grep -q "equivalent_api_cost_cents" /app/server/dist/services/heartbeat.js \
-    && echo "✓ heartbeat.ts patches compiled into dist/"
+    && grep -q "blockersSvcForGuard" /app/server/dist/services/heartbeat.js \
+    && grep -q "runGuards" /app/server/dist/routes/issues.js \
+    && grep -q "runGuards" /app/server/dist/services/guards.js \
+    && grep -q "checkRequiredCredentials" /app/server/dist/routes/issues.js \
+    && grep -q "CREDENTIAL_CAPABILITIES" /app/server/dist/services/task-types.js \
+    && node --input-type=module -e "await import('/app/server/dist/routes/issues.js')" < /dev/null \
+    && node --input-type=module -e "await import('/app/server/dist/services/heartbeat.js')" < /dev/null \
+    && echo "✓ all patches compiled; routes/issues.js and heartbeat.js load cleanly"
 
 # PATCH 4.1: Patch compiled dashboard.js so monthSpend includes the
 # equivalent_api_cost_cents column (which heartbeat.ts now populates for
@@ -64,40 +83,7 @@ RUN sed -i 's|coalesce(sum(${costEvents.costCents}), 0)::int|coalesce(sum(${cost
 # stale (older upstream baseline) and overwriting the newer file breaks vite
 # build. No UI rebuild needed; upstream already has the desired behavior.
 
-# ─── PATCH 5.1: Deterministic guards (DEV-164 Harness v2 Fase 3) ─────────────
-# Adds server/src/services/guards.ts which implements guard checks for
-# agent status transitions:
-#   in_progress → in_review : requireValidationEvidence, requireOutputSchema,
-#                              requirePRUrl, requireRepoCoverage
-#   in_review   → done      : requireValidationEvidence, requireOutputSchema
-#
-# requireRepoCoverage is now FULLY IMPLEMENTED (DEV-165):
-#   - Parses "multi-repo-report: {...}" JSON block from transition comment
-#   - Validates len(repos_succeeded) + len(repos_failed) == len(repos_targeted)
-#   - Blocks with Telegram alert on coverage gap (no silent drops)
-#
-# When a guard fails:
-#   - The requested status is overridden to "blocked" (auto-transition)
-#   - blockerService.create() fires a Telegram notification to #1304
-#   - The PATCH response returns the blocked issue so the agent can react
-#
-# Source: plans/20260411-harness-reliability-program-v2 (Fase 3 + 4)
-# Depends on: DEV-161 (blockerService), DEV-164 (guards wiring), DEV-165 (this)
-COPY patches/guards.ts /app/server/src/services/guards.ts
-
-# PATCH 5.2: Inject runGuards into the PATCH /issues/:id route handler.
-# patch-guards.js surgically patches routes/issues.ts:
-#   1. Adds `import { runGuards } from "../services/guards.js";`
-#   2. Inserts a guard block before `let issue;` in the route body
-# Then recompiles the full server with tsc.
-COPY patches/patch-guards.cjs /tmp/patch-guards.cjs
-RUN node /tmp/patch-guards.cjs \
-    && cd /app/server && npx tsc 2>&1 || true \
-    && grep -q "runGuards" /app/server/dist/routes/issues.js \
-    && grep -q "runGuards" /app/server/dist/services/guards.js \
-    && echo "✓ guards.ts compiled into dist/services/guards.js and wired into routes/issues.js"
-
-# ─── PATCH 6.1: multi-gitter CLI (DEV-165 Harness v2 Fase 4) ──────────────────
+# ─── DEV-165: multi-gitter CLI (Harness v2 Fase 4) ────────────────────────────
 # Installs multi-gitter, the fleet-wide PR automation tool.
 # Used by the multi-repo-rollout task type executed by dfl-rollout-ops.
 # Pinned version for reproducibility — bump deliberately.
@@ -112,10 +98,6 @@ RUN ARCH=$(dpkg --print-architecture | sed 's/amd64/x86_64/;s/arm64/ARM64/') \
     && multi-gitter version \
     && echo "✓ multi-gitter ${MULTI_GITTER_VERSION} installed"
 
-# PATCH 6.2: multi-gitter adapter service
-# Copies server/src/services/multi-gitter.ts into the compiled server and
-# recompiles with tsc so it becomes importable by dfl-rollout-ops via the
-# Paperclip skill layer.
 COPY patches/multi-gitter.ts /app/server/src/services/multi-gitter.ts
 RUN cd /app/server && npx tsc 2>&1 || true \
     && test -f /app/server/dist/services/multi-gitter.js \
