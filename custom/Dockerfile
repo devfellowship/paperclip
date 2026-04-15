@@ -64,40 +64,31 @@ RUN sed -i 's|coalesce(sum(${costEvents.costCents}), 0)::int|coalesce(sum(${cost
 # stale (older upstream baseline) and overwriting the newer file breaks vite
 # build. No UI rebuild needed; upstream already has the desired behavior.
 
-# ─── PATCH 5.1: Deterministic guards (DEV-164 Harness v2 Fase 3) ─────────────
-# Adds server/src/services/guards.ts which implements guard checks for
-# agent status transitions:
-#   in_progress → in_review : requireValidationEvidence, requireOutputSchema,
-#                              requirePRUrl, requireRepoCoverage
-#   in_review   → done      : requireValidationEvidence, requireOutputSchema
+# ─── DEV-164 + DEV-251: guards.ts, task-types.ts, and routes/issues.ts ────────
 #
-# requireRepoCoverage is now FULLY IMPLEMENTED (DEV-165):
-#   - Parses "multi-repo-report: {...}" JSON block from transition comment
-#   - Validates len(repos_succeeded) + len(repos_failed) == len(repos_targeted)
-#   - Blocks with Telegram alert on coverage gap (no silent drops)
+# DEV-164 (Harness v2 Fase 3): Deterministic guards on agent status transitions.
+#   guards.ts implements guard checks for in_progress→in_review and in_review→done.
+#   requireRepoCoverage is fully implemented (DEV-165).
 #
-# When a guard fails:
-#   - The requested status is overridden to "blocked" (auto-transition)
-#   - blockerService.create() fires a Telegram notification to #1304
-#   - The PATCH response returns the blocked issue so the agent can react
+# DEV-251 (Harness v2 WS-4): Credential-presence guard at checkout time.
+#   task-types.ts adds CREDENTIAL_CAPABILITIES + checkRequiredCredentials().
+#   Both features are baked directly into routes/issues.ts as TypeScript — no
+#   CJS patching, no string substitution. This eliminates the template-literal
+#   mangling that caused the PR-15 boot loop.
 #
-# Source: plans/20260411-harness-reliability-program-v2 (Fase 3 + 4)
-# Depends on: DEV-161 (blockerService), DEV-164 (guards wiring), DEV-165 (this)
+# Build order: copy all three source files, then compile once.
 COPY patches/guards.ts /app/server/src/services/guards.ts
-
-# PATCH 5.2: Inject runGuards into the PATCH /issues/:id route handler.
-# patch-guards.js surgically patches routes/issues.ts:
-#   1. Adds `import { runGuards } from "../services/guards.js";`
-#   2. Inserts a guard block before `let issue;` in the route body
-# Then recompiles the full server with tsc.
-COPY patches/patch-guards.cjs /tmp/patch-guards.cjs
-RUN node /tmp/patch-guards.cjs \
-    && cd /app/server && npx tsc 2>&1 || true \
+COPY patches/task-types.ts /app/server/src/services/task-types.ts
+COPY patches/issues.ts /app/server/src/routes/issues.ts
+RUN cd /app/server && npx tsc 2>&1 || true \
     && grep -q "runGuards" /app/server/dist/routes/issues.js \
     && grep -q "runGuards" /app/server/dist/services/guards.js \
-    && echo "✓ guards.ts compiled into dist/services/guards.js and wired into routes/issues.js"
+    && grep -q "checkRequiredCredentials" /app/server/dist/routes/issues.js \
+    && grep -q "CREDENTIAL_CAPABILITIES" /app/server/dist/services/task-types.js \
+    && node --input-type=module -e "await import('/app/server/dist/routes/issues.js')" < /dev/null \
+    && echo "✓ guards + credential guard compiled and routes/issues.js loads cleanly"
 
-# ─── PATCH 6.1: multi-gitter CLI (DEV-165 Harness v2 Fase 4) ──────────────────
+# ─── DEV-165: multi-gitter CLI (Harness v2 Fase 4) ────────────────────────────
 # Installs multi-gitter, the fleet-wide PR automation tool.
 # Used by the multi-repo-rollout task type executed by dfl-rollout-ops.
 # Pinned version for reproducibility — bump deliberately.
@@ -112,31 +103,11 @@ RUN ARCH=$(dpkg --print-architecture | sed 's/amd64/x86_64/;s/arm64/ARM64/') \
     && multi-gitter version \
     && echo "✓ multi-gitter ${MULTI_GITTER_VERSION} installed"
 
-# PATCH 6.2: multi-gitter adapter service
-# Copies server/src/services/multi-gitter.ts into the compiled server and
-# recompiles with tsc so it becomes importable by dfl-rollout-ops via the
-# Paperclip skill layer.
 COPY patches/multi-gitter.ts /app/server/src/services/multi-gitter.ts
 RUN cd /app/server && npx tsc 2>&1 || true \
     && test -f /app/server/dist/services/multi-gitter.js \
     && grep -q "invokeMultiGitter" /app/server/dist/services/multi-gitter.js \
     && echo "✓ multi-gitter.ts compiled into dist/services/multi-gitter.js"
-
-# ─── PATCH 7.1: Credential guard (DEV-251 Harness v2 WS-4) ───────────────────
-# At checkout time, if the issue has a task_type, the server pre-checks that
-# the assignee agent's adapterConfig.env contains all required credential keys.
-# Missing creds → issue auto-transitions to "blocked" + Telegram via blockersSvc.
-#
-# Adds:
-#   - required_credentials per TaskType to server/src/services/task-types.ts
-#   - checkRequiredCredentials() helper in task-types.ts
-#   - patch-credentials.cjs injects the guard into POST /issues/:id/checkout
-COPY patches/patch-credentials.cjs /tmp/patch-credentials.cjs
-RUN node /tmp/patch-credentials.cjs \
-    && cd /app/server && npx tsc 2>&1 || true \
-    && grep -q "checkRequiredCredentials" /app/server/dist/routes/issues.js \
-    && grep -q "CREDENTIAL_CAPABILITIES" /app/server/dist/services/task-types.js \
-    && echo "✓ credential guard injected into checkout route and compiled"
 
 # Note: no `USER node` — the entrypoint needs root to remap UID/GID then drops
 # to node via gosu. Matches the base paperclip:latest image (v2026.403.0+).
