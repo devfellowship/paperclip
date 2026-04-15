@@ -40,6 +40,9 @@ import {
   sanitizeRuntimeServiceBaseEnv,
 } from "./workspace-runtime.js";
 import { issueService } from "./issues.js";
+import { agentService as agentSvcFactory } from "./agents.js";
+import { blockerService } from "./blockers.js";
+import { checkRequiredCredentials } from "./task-types.js";
 import { executionWorkspaceService } from "./execution-workspaces.js";
 import { workspaceOperationService } from "./workspace-operations.js";
 import {
@@ -808,6 +811,8 @@ export function heartbeatService(db: Db) {
   const secretsSvc = secretService(db);
   const companySkills = companySkillService(db);
   const issuesSvc = issueService(db);
+  const agentsSvcForGuard = agentSvcFactory(db);
+  const blockersSvcForGuard = blockerService(db);
   const executionWorkspacesSvc = executionWorkspaceService(db);
   const workspaceOperationsSvc = workspaceOperationService(db);
   const activeRunExecutions = new Set<string>();
@@ -3886,12 +3891,16 @@ export function heartbeatService(db: Db) {
 
       // ─── PATCH 1.2: Hard timeout for runaway runs ───────────────────
       // Default cap = 20 min. Override per-agent via runtime_config.heartbeat.maxRunSec.
+      // runningRuns is declared outside try so PATCH 8.1 can reuse it.
       const DEFAULT_MAX_RUN_SEC = 1200;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let runningRunsForGuard: any[] = [];
       try {
         const runningRuns = await db
           .select()
           .from(heartbeatRuns)
           .where(eq(heartbeatRuns.status, "running"));
+        runningRunsForGuard = runningRuns;
         for (const r of runningRuns) {
           if (!r.startedAt) continue;
           const ageSec = (now.getTime() - new Date(r.startedAt).getTime()) / 1000;
@@ -3914,6 +3923,179 @@ export function heartbeatService(db: Db) {
         }
       } catch (err) {
         logger.error({ err }, "Heartbeat janitor pass failed");
+      }
+
+      // ─── PATCH 8.1: Mid-flight verification (DEV-250 Harness v2 WS-3.3) ────
+      // Runs on every janitor tick after PATCH 1.2.
+      // Pass A: budget re-check on currently running runs → cancel + block if exceeded.
+      // Pass B: credential re-check on in-progress typed tasks → block if creds missing.
+      // Pass C: stuck-task heuristic → block if many completed runs with no issue progress.
+      try {
+        const MF_STUCK_THRESHOLD = 8;
+        const MF_STUCK_WINDOW_MS = 60 * 60 * 1000; // 60 min
+
+        // Pass A — budget re-check on running runs
+        for (const r of runningRunsForGuard) {
+          try {
+            const ctx = parseObject((r as { contextSnapshot?: unknown }).contextSnapshot);
+            const issueId = typeof ctx["issueId"] === "string" ? ctx["issueId"] : null;
+            if (!issueId) continue;
+            const companyId = typeof (r as { companyId?: unknown }).companyId === "string"
+              ? (r as { companyId: string }).companyId : null;
+            const agentId = typeof (r as { agentId?: unknown }).agentId === "string"
+              ? (r as { agentId: string }).agentId : null;
+            if (!companyId || !agentId) continue;
+            const budgetBlock = await budgets.getInvocationBlock(companyId, agentId, { issueId });
+            if (!budgetBlock) continue;
+            logger.warn({ runId: (r as { id: string }).id, agentId, issueId, reason: budgetBlock.reason }, "PATCH 8.1 Pass A: mid-flight budget block");
+            await cancelRunInternal((r as { id: string }).id, "Mid-flight budget guard: " + budgetBlock.reason);
+            await issuesSvc.update(issueId, { status: "blocked", actorAgentId: agentId })
+              .catch((err: unknown) => logger.warn({ err, issueId }, "PATCH 8.1: failed to block issue (budget)"));
+            await issuesSvc.addComment(issueId,
+              "Mid-flight budget guard: task blocked.\n\n" +
+              budgetBlock.reason + "\n\n" +
+              "Resolve the budget overrun for this agent or company, then re-checkout.",
+              { agentId },
+            ).catch((err: unknown) => logger.warn({ err, issueId }, "PATCH 8.1: failed to add comment (budget)"));
+            void blockersSvcForGuard.create({
+              taskId: issueId,
+              agentId,
+              summary: "Mid-flight budget guard: " + budgetBlock.reason,
+              needs: "Resolve budget overrun before re-checkout",
+              context: "Budget exceeded while heartbeat run " + (r as { id: string }).id + " was running",
+            }).catch((err: unknown) => logger.warn({ err, issueId }, "PATCH 8.1: blockersSvc.create failed (budget)"));
+          } catch (err) {
+            logger.warn({ err, runId: (r as { id?: string }).id }, "PATCH 8.1 Pass A: error on run, skipping");
+          }
+        }
+
+        // Pass B — credential re-check on in-progress typed issues
+        const inProgressTypedIssues = await db
+          .select({
+            id: issues.id,
+            taskType: issues.taskType,
+            taskBody: issues.taskBody,
+            assigneeAgentId: issues.assigneeAgentId,
+            executionRunId: issues.executionRunId,
+            title: issues.title,
+            identifier: issues.identifier,
+          })
+          .from(issues)
+          .where(and(eq(issues.status, "in_progress"), sql`${issues.taskType} is not null`));
+
+        for (const iss of inProgressTypedIssues) {
+          try {
+            if (!iss.assigneeAgentId || !iss.taskType) continue;
+            const assigneeAgent = allAgents.find((a) => a.id === iss.assigneeAgentId);
+            if (!assigneeAgent) continue;
+            const adapterEnv = (assigneeAgent.adapterConfig as Record<string, unknown> | null | undefined)?.["env"];
+            const agentEnvKeys =
+              adapterEnv && typeof adapterEnv === "object" && !Array.isArray(adapterEnv)
+                ? Object.keys(adapterEnv)
+                : [];
+            const taskBodyObj = iss.taskBody as Record<string, unknown> | null | undefined;
+            const requiredOverride = Array.isArray(taskBodyObj?.["required_credentials"])
+              ? (taskBodyObj!["required_credentials"] as string[])
+              : null;
+            const credCheck = checkRequiredCredentials(iss.taskType, agentEnvKeys, requiredOverride);
+            if (credCheck.ok) continue;
+            const missingList = credCheck.missing.join(", ");
+            logger.warn({ issueId: iss.id, missing: credCheck.missing }, "PATCH 8.1 Pass B: mid-flight credential check failed");
+            await issuesSvc.update(iss.id, { status: "blocked", actorAgentId: iss.assigneeAgentId })
+              .catch((err: unknown) => logger.warn({ err, issueId: iss.id }, "PATCH 8.1: failed to block issue (creds)"));
+            await issuesSvc.addComment(iss.id,
+              "Mid-flight credential guard: task blocked.\n\n" +
+              "Missing credentials: **" + missingList + "**\n\n" +
+              "Credentials were present at checkout but are no longer detectable. " +
+              "Re-provision in Infisical `/agents/<name>/` or adapterConfig.env, then re-checkout.\n\nsecrets:need " + missingList,
+              { agentId: iss.assigneeAgentId },
+            ).catch((err: unknown) => logger.warn({ err, issueId: iss.id }, "PATCH 8.1: failed to add comment (creds)"));
+            if (iss.executionRunId) {
+              await cancelRunInternal(iss.executionRunId, "Mid-flight credential guard: missing " + missingList)
+                .catch(() => {});
+            }
+            void blockersSvcForGuard.create({
+              taskId: iss.id,
+              agentId: iss.assigneeAgentId,
+              summary: "Mid-flight cred guard: missing " + missingList,
+              needs: "Provision in Infisical /agents/<name>/: " + missingList,
+              context:
+                "Credential lost mid-run for " + (iss.identifier ?? iss.id) +
+                " — task_type=" + iss.taskType + ", missing=" + missingList,
+              issueTitle: iss.title ?? undefined,
+              issueIdentifier: iss.identifier ?? undefined,
+            }).catch((err: unknown) => logger.warn({ err, issueId: iss.id }, "PATCH 8.1: blockersSvc.create failed (creds)"));
+          } catch (err) {
+            logger.warn({ err, issueId: iss.id }, "PATCH 8.1 Pass B: error on issue, skipping");
+          }
+        }
+
+        // Pass C — stuck-task heuristic (proxy for tool-call loop)
+        // Counts recent completed heartbeat runs and groups them by the issueId in contextSnapshot.
+        // If an issue has >= MF_STUCK_THRESHOLD completed runs in the window, it is likely stuck.
+        const windowStart = new Date(now.getTime() - MF_STUCK_WINDOW_MS);
+        const recentCompletedRuns = await db
+          .select({ agentId: heartbeatRuns.agentId, contextSnapshot: heartbeatRuns.contextSnapshot })
+          .from(heartbeatRuns)
+          .where(and(
+            gt(heartbeatRuns.startedAt, windowStart),
+            inArray(heartbeatRuns.status, ["succeeded", "failed", "cancelled"]),
+          ));
+        const runCountByIssue = new Map<string, number>();
+        for (const r of recentCompletedRuns) {
+          const ctx = parseObject(r.contextSnapshot);
+          const iid = typeof ctx["issueId"] === "string" ? ctx["issueId"] : null;
+          if (iid) runCountByIssue.set(iid, (runCountByIssue.get(iid) ?? 0) + 1);
+        }
+        const allInProgressIssues = await db
+          .select({
+            id: issues.id,
+            assigneeAgentId: issues.assigneeAgentId,
+            title: issues.title,
+            identifier: issues.identifier,
+            executionRunId: issues.executionRunId,
+          })
+          .from(issues)
+          .where(eq(issues.status, "in_progress"));
+        for (const iss of allInProgressIssues) {
+          try {
+            const runCount = runCountByIssue.get(iss.id) ?? 0;
+            if (runCount < MF_STUCK_THRESHOLD) continue;
+            logger.warn({ issueId: iss.id, runCount }, "PATCH 8.1 Pass C: stuck-task detected");
+            const agentId = iss.assigneeAgentId ?? "unknown";
+            const comment =
+              "Stuck-task guard: " + runCount + " consecutive completed runs in the last 60 minutes without status progress.\n\n" +
+              "This indicates a possible tool-call loop or runaway agent. Task transitioned to blocked for investigation.";
+            await issuesSvc.update(iss.id, { status: "blocked", actorAgentId: agentId })
+              .catch((err: unknown) => logger.warn({ err, issueId: iss.id }, "PATCH 8.1: failed to block issue (stuck)"));
+            await issuesSvc.addComment(iss.id, comment, { agentId })
+              .catch((err: unknown) => logger.warn({ err, issueId: iss.id }, "PATCH 8.1: failed to add comment (stuck)"));
+            const activeRun = runningRunsForGuard.find(
+              (r) => (r as { agentId?: string }).agentId === iss.assigneeAgentId,
+            );
+            if (activeRun) {
+              await cancelRunInternal(
+                (activeRun as { id: string }).id,
+                "Stuck-task guard: " + runCount + " runs without progress",
+              ).catch(() => {});
+            }
+            void blockersSvcForGuard.create({
+              taskId: iss.id,
+              agentId,
+              summary: "Stuck-task: " + runCount + " runs without status progress",
+              needs: "Investigate what the agent was doing across the last " + runCount + " runs",
+              context:
+                "Issue " + (iss.identifier ?? iss.id) +
+                " had " + runCount + " completed runs in 60 min with no advance from in_progress",
+              issueTitle: iss.title ?? undefined,
+              issueIdentifier: iss.identifier ?? undefined,
+            }).catch((err: unknown) => logger.warn({ err, issueId: iss.id }, "PATCH 8.1: blockersSvc.create failed (stuck)"));
+          } catch (err) {
+            logger.warn({ err, issueId: iss.id }, "PATCH 8.1 Pass C: error on issue, skipping");
+          }
+        }
+      } catch (err) {
+        logger.error({ err }, "PATCH 8.1: Mid-flight janitor pass failed");
       }
 
       for (const agent of allAgents) {

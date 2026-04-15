@@ -41,14 +41,33 @@ RUN apt-get update -qq && apt-get install -y --no-install-recommends curl ca-cer
 #   - PATCH 1.3: exponential backoff on consecutive no-work runs
 # Source: plans/20260407-paperclip-cost-optimizations.md
 #
-# The runtime entry point is `server/dist/index.js`, which imports from
-# `dist/services/heartbeat.js`. So we must overwrite both the .ts source AND
-# the compiled .js. Recompiling via tsc inside the image is the cleanest path.
+# ─── Paperclip source patches (all copied before single tsc compile) ─────────
+#
+# All custom .ts files are COPYd first, then compiled together in one `npx tsc`
+# pass. This avoids cross-dependency issues (e.g., heartbeat.ts imports
+# task-types.ts, so both must be present before compile).
+#
+# Files and their patch origins:
+#   heartbeat.ts  — PATCH 1.1/1.2/1.3 (cost opts) + PATCH 4.1 (equiv cost) +
+#                   PATCH 8.1 (DEV-250 mid-flight verification)
+#   guards.ts     — DEV-164 (deterministic status-transition guards)
+#   task-types.ts — DEV-167 (task type taxonomy) + DEV-251 (credential caps)
+#   issues.ts     — DEV-164 (runGuards wire-up) + DEV-251 (checkout cred guard)
 COPY patches/heartbeat.ts /app/server/src/services/heartbeat.ts
+COPY patches/guards.ts /app/server/src/services/guards.ts
+COPY patches/task-types.ts /app/server/src/services/task-types.ts
+COPY patches/issues.ts /app/server/src/routes/issues.ts
 RUN cd /app/server && npx tsc 2>&1 || true \
     && grep -q "skippedNoWork" /app/server/dist/services/heartbeat.js \
     && grep -q "equivalent_api_cost_cents" /app/server/dist/services/heartbeat.js \
-    && echo "✓ heartbeat.ts patches compiled into dist/"
+    && grep -q "blockersSvcForGuard" /app/server/dist/services/heartbeat.js \
+    && grep -q "runGuards" /app/server/dist/routes/issues.js \
+    && grep -q "runGuards" /app/server/dist/services/guards.js \
+    && grep -q "checkRequiredCredentials" /app/server/dist/routes/issues.js \
+    && grep -q "CREDENTIAL_CAPABILITIES" /app/server/dist/services/task-types.js \
+    && node --input-type=module -e "await import('/app/server/dist/routes/issues.js')" < /dev/null \
+    && node --input-type=module -e "await import('/app/server/dist/services/heartbeat.js')" < /dev/null \
+    && echo "✓ all patches compiled; routes/issues.js and heartbeat.js load cleanly"
 
 # PATCH 4.1: Patch compiled dashboard.js so monthSpend includes the
 # equivalent_api_cost_cents column (which heartbeat.ts now populates for
@@ -63,30 +82,6 @@ RUN sed -i 's|coalesce(sum(${costEvents.costCents}), 0)::int|coalesce(sum(${cost
 # (same intent as our getUnreadTouchedIssues patch). Our patches/inbox.ts is
 # stale (older upstream baseline) and overwriting the newer file breaks vite
 # build. No UI rebuild needed; upstream already has the desired behavior.
-
-# ─── DEV-164 + DEV-251: guards.ts, task-types.ts, and routes/issues.ts ────────
-#
-# DEV-164 (Harness v2 Fase 3): Deterministic guards on agent status transitions.
-#   guards.ts implements guard checks for in_progress→in_review and in_review→done.
-#   requireRepoCoverage is fully implemented (DEV-165).
-#
-# DEV-251 (Harness v2 WS-4): Credential-presence guard at checkout time.
-#   task-types.ts adds CREDENTIAL_CAPABILITIES + checkRequiredCredentials().
-#   Both features are baked directly into routes/issues.ts as TypeScript — no
-#   CJS patching, no string substitution. This eliminates the template-literal
-#   mangling that caused the PR-15 boot loop.
-#
-# Build order: copy all three source files, then compile once.
-COPY patches/guards.ts /app/server/src/services/guards.ts
-COPY patches/task-types.ts /app/server/src/services/task-types.ts
-COPY patches/issues.ts /app/server/src/routes/issues.ts
-RUN cd /app/server && npx tsc 2>&1 || true \
-    && grep -q "runGuards" /app/server/dist/routes/issues.js \
-    && grep -q "runGuards" /app/server/dist/services/guards.js \
-    && grep -q "checkRequiredCredentials" /app/server/dist/routes/issues.js \
-    && grep -q "CREDENTIAL_CAPABILITIES" /app/server/dist/services/task-types.js \
-    && node --input-type=module -e "await import('/app/server/dist/routes/issues.js')" < /dev/null \
-    && echo "✓ guards + credential guard compiled and routes/issues.js loads cleanly"
 
 # ─── DEV-165: multi-gitter CLI (Harness v2 Fase 4) ────────────────────────────
 # Installs multi-gitter, the fleet-wide PR automation tool.
