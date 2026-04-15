@@ -35,6 +35,13 @@ import {
   reconcilePersistedRuntimeServicesOnStartup,
   routineService,
 } from "./services/index.js";
+import { issueService } from "./services/issues.js";
+import {
+  createFleetWatcherTick,
+  fetchFailingPRs,
+  fetchFleetSnapshot,
+  type FleetWatcherDeps,
+} from "./services/fleet-regression-watcher.js";
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
@@ -621,6 +628,65 @@ export async function startServer(): Promise<StartedServer> {
     }, config.heartbeatSchedulerIntervalMs);
   }
   
+  // --- Fleet regression watcher (DEV-245) ---------------------------------
+  // Reconciles https://fleet-health.devfellowship.com/api/failing-prs against
+  // Paperclip issues so agents have a Paperclip-native trigger for every red
+  // fleet PR. Opt-in: requires PAPERCLIP_FLEET_WATCHER_COMPANY_ID.
+  {
+    const fleetWatcherCompanyId = process.env.PAPERCLIP_FLEET_WATCHER_COMPANY_ID?.trim();
+    const fleetWatcherEnabled = fleetWatcherCompanyId && process.env.PAPERCLIP_FLEET_WATCHER_ENABLED !== "false";
+    if (fleetWatcherEnabled && fleetWatcherCompanyId) {
+      const intervalMs = Number(process.env.PAPERCLIP_FLEET_WATCHER_INTERVAL_MS ?? 15 * 60 * 1000);
+      const digestHourUtc = Number(process.env.PAPERCLIP_FLEET_WATCHER_DIGEST_HOUR_UTC ?? 12);
+      const issues = issueService(db as any);
+      const deps: FleetWatcherDeps = {
+        fetchFailingPRs,
+        fetchFleetSnapshot,
+        issues,
+        db: db as any,
+        companyId: fleetWatcherCompanyId,
+        postDigest: async (digest) => {
+          const token = process.env.TELEGRAM_BLOCKERS_BOT_TOKEN;
+          const chatId = process.env.TELEGRAM_BLOCKERS_CHAT_ID;
+          const threadId = process.env.TELEGRAM_BLOCKERS_THREAD_ID ?? process.env.PAPERCLIP_FLEET_WATCHER_TELEGRAM_THREAD_ID;
+          if (!token || !chatId) {
+            logger.info({ digest }, "fleet-watcher: no Telegram credentials, logging digest only");
+            return;
+          }
+          try {
+            const body: Record<string, unknown> = { chat_id: chatId, text: digest };
+            if (threadId) body.message_thread_id = Number(threadId);
+            const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(body),
+            });
+            if (!res.ok) {
+              const errorBody = await res.text().catch(() => "unknown");
+              logger.warn({ status: res.status, body: errorBody }, "fleet-watcher: Telegram digest post failed");
+            }
+          } catch (err) {
+            logger.warn({ err }, "fleet-watcher: Telegram digest post threw");
+          }
+        },
+      };
+      const { tick } = createFleetWatcherTick(deps, { digestHourUtc });
+      logger.info(
+        { companyId: fleetWatcherCompanyId, intervalMs, digestHourUtc },
+        "Fleet regression watcher enabled (DEV-245)",
+      );
+      // Run once on startup (fire-and-forget), then on interval.
+      void tick();
+      setInterval(() => {
+        void tick();
+      }, intervalMs);
+    } else {
+      logger.debug(
+        "Fleet regression watcher not started (set PAPERCLIP_FLEET_WATCHER_COMPANY_ID to enable)",
+      );
+    }
+  }
+
   if (config.databaseBackupEnabled) {
     const backupIntervalMs = config.databaseBackupIntervalMinutes * 60 * 1000;
     const settingsSvc = instanceSettingsService(db);
