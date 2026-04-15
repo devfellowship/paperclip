@@ -122,6 +122,32 @@ export interface RoutineRunSummary extends RoutineRun {
   trigger: Pick<RoutineTrigger, "id" | "kind" | "label"> | null;
 }
 
+/**
+ * A single inbound webhook event row, returned by
+ * `GET /api/companies/:id/webhook-events`.
+ *
+ * Populated from the `webhook_events` table which is written when Paperclip
+ * receives an inbound webhook from an external system (e.g. GitHub).
+ */
+export interface WebhookEventSummary {
+  id: string;
+  /** Source system — e.g. "github". */
+  source: string;
+  /** Event type header value — e.g. "workflow_run", "push". */
+  eventType: string;
+  /** Repository full name — e.g. "devfellowship/paperclip". */
+  repo: string | null;
+  /** Pull request number extracted from payload, if present. */
+  prNumber: number | null;
+  /** Workflow/CI run ID extracted from payload, if present. */
+  runId: number | null;
+  /** `payload.action` value — e.g. "completed". */
+  action: string | null;
+  /** `payload.workflow_run.conclusion` — e.g. "success", "failure". */
+  conclusion: string | null;
+  receivedAt: Date;
+}
+
 export interface RoutineExecutionIssueOrigin {
   kind: Extract<IssueOriginKind, "routine_execution">;
   routineId: string;

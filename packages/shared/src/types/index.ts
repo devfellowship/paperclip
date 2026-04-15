@@ -146,6 +146,7 @@ export type {
   RoutineTriggerSecretMaterial,
   RoutineDetail,
   RoutineRunSummary,
+  WebhookEventSummary,
   RoutineExecutionIssueOrigin,
   RoutineListItem,
 } from "./routine.js";

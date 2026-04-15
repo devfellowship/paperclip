@@ -62,3 +62,4 @@ export { pluginJobs, pluginJobRuns } from "./plugin_jobs.js";
 export { pluginWebhookDeliveries } from "./plugin_webhooks.js";
 export { pluginLogs } from "./plugin_logs.js";
 export { blockerNotifications } from "./blocker_notifications.js";
+export { webhookEvents } from "./webhook_events.js";

@@ -348,6 +348,7 @@ export type {
   RoutineTriggerSecretMaterial,
   RoutineDetail,
   RoutineRunSummary,
+  WebhookEventSummary,
   RoutineExecutionIssueOrigin,
   RoutineListItem,
   JsonSchema,
