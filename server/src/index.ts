@@ -48,6 +48,7 @@ import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
 import { maybePersistWorktreeRuntimePorts } from "./worktree-config.js";
 import { initTelemetry, getTelemetryClient } from "./telemetry.js";
+import { initTelemetry as initOtelTelemetry } from "./otel.js";
 
 type BetterAuthSessionUser = {
   id: string;
@@ -89,6 +90,11 @@ export interface StartedServer {
 export async function startServer(): Promise<StartedServer> {
   let config = loadConfig();
   initTelemetry({ enabled: config.telemetryEnabled });
+  // DEV-269: OTel + Langfuse tracing. Separate from usage telemetry above.
+  // Kill switch: PAPERCLIP_TELEMETRY_ENABLED=false (note: different from
+  // config.telemetryEnabled which controls usage analytics). No-op if creds
+  // missing. Never throws.
+  initOtelTelemetry();
   if (process.env.PAPERCLIP_SECRETS_PROVIDER === undefined) {
     process.env.PAPERCLIP_SECRETS_PROVIDER = config.secretsProvider;
   }
