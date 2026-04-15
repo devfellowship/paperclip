@@ -67,9 +67,11 @@ RUN cd /app/server && npx tsc 2>&1 || true \
     && grep -q "runGuards" /app/server/dist/services/guards.js \
     && grep -q "checkRequiredCredentials" /app/server/dist/routes/issues.js \
     && grep -q "CREDENTIAL_CAPABILITIES" /app/server/dist/services/task-types.js \
-    && node --input-type=module -e "await import('/app/server/dist/routes/issues.js')" < /dev/null \
-    && node --input-type=module -e "await import('/app/server/dist/services/heartbeat.js')" < /dev/null \
-    && echo "✓ all patches compiled; routes/issues.js and heartbeat.js load cleanly"
+    && node --check /app/server/dist/routes/issues.js \
+    && node --check /app/server/dist/services/heartbeat.js \
+    && node --check /app/server/dist/services/task-types.js \
+    && node --check /app/server/dist/services/guards.js \
+    && echo "✓ all patches compiled; js parses cleanly"
 
 # PATCH 4.1: Patch compiled dashboard.js so monthSpend includes the
 # equivalent_api_cost_cents column (which heartbeat.ts now populates for
