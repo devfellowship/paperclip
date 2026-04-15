@@ -51,6 +51,7 @@ import {
 import { issueService } from "./issues.js";
 import { executionWorkspaceService, mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { workspaceOperationService } from "./workspace-operations.js";
+import { gatherContextPacket } from "./context-gathering.js";
 import { isProcessGroupAlive, terminateLocalService } from "./local-service-supervisor.js";
 import {
   buildExecutionWorkspaceAdapterConfig,
@@ -3295,6 +3296,36 @@ export function heartbeatService(db: Db) {
           },
           "local agent jwt secret missing or invalid; running without injected PAPERCLIP_API_KEY",
         );
+      }
+      // DEV-247 / WS-2: write a pre-task context packet so agents start with
+      // real state instead of burning LLM tool calls to re-discover it.
+      // Non-fatal: any failure here must NEVER block adapter.execute.
+      if (issueRef && executionWorkspace.cwd) {
+        try {
+          const packet = await gatherContextPacket({
+            issue: {
+              id: issueRef.id,
+              companyId: agent.companyId,
+              parentId: null,
+              githubRepo: null,
+              githubPrNumber: null,
+            },
+            agent: { id: agent.id, name: agent.name, companyId: agent.companyId },
+            workspaceCwd: executionWorkspace.cwd,
+            db,
+          });
+          if (packet) {
+            logger.info(
+              { runId: run.id, path: packet.path, bytes: packet.bytesWritten },
+              "context-packet-written",
+            );
+          }
+        } catch (err) {
+          logger.warn(
+            { runId: run.id, err: String(err) },
+            "context-gathering failed; proceeding without packet",
+          );
+        }
       }
       const adapterResult = await adapter.execute({
         runId: run.id,
