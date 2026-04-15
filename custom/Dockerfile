@@ -54,9 +54,11 @@ RUN apt-get update -qq && apt-get install -y --no-install-recommends curl ca-cer
 #   task-types.ts — DEV-167 (task type taxonomy) + DEV-251 (credential caps)
 #   issues.ts     — DEV-164 (runGuards wire-up) + DEV-251 (checkout cred guard)
 COPY patches/heartbeat.ts /app/server/src/services/heartbeat.ts
-COPY patches/guards.ts /app/server/src/services/guards.ts
 COPY patches/task-types.ts /app/server/src/services/task-types.ts
 COPY patches/issues.ts /app/server/src/routes/issues.ts
+# NOTE: guards.ts moved out of patches/ into server/src/services/ as part of
+# PR #19 (DEV-251) which removed CJS patching. It's now compiled by the base
+# paperclip:latest build and inherited here — no need to COPY it.
 RUN cd /app/server && npx tsc 2>&1 || true \
     && grep -q "skippedNoWork" /app/server/dist/services/heartbeat.js \
     && grep -q "equivalent_api_cost_cents" /app/server/dist/services/heartbeat.js \
