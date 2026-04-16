@@ -48,14 +48,22 @@ RUN apt-get update -qq && apt-get install -y --no-install-recommends curl ca-cer
 # task-types.ts, so both must be present before compile).
 #
 # Files and their patch origins:
-#   heartbeat.ts  — PATCH 1.1/1.2/1.3 (cost opts) + PATCH 4.1 (equiv cost) +
-#                   PATCH 8.1 (DEV-250 mid-flight verification)
-#   guards.ts     — DEV-164 (deterministic status-transition guards)
-#   task-types.ts — DEV-167 (task type taxonomy) + DEV-251 (credential caps)
-#   issues.ts     — DEV-164 (runGuards wire-up) + DEV-251 (checkout cred guard)
+#   heartbeat.ts       — PATCH 1.1/1.2/1.3 (cost opts) + PATCH 4.1 (equiv cost)
+#                        + PATCH 8.1 (DEV-250 mid-flight verification)
+#   guards.ts          — DEV-164 (deterministic status-transition guards)
+#   task-types.ts      — DEV-167 (task type taxonomy) + DEV-251 (credential
+#                        caps) + DEV-252 (paste-key registry)
+#   issues.ts          — DEV-164 (runGuards wire-up) + DEV-251 (checkout cred
+#                        guard) + DEV-252 (paste: KEY=… hints in blocker body)
+#   secrets-resolver.ts — DEV-252 (new): Telegram reply → Infisical write →
+#                        task resume
+#   blockers.ts        — DEV-252: mount /api/telegram/blockers-webhook on the
+#                        existing blocker router
 COPY patches/heartbeat.ts /app/server/src/services/heartbeat.ts
 COPY patches/task-types.ts /app/server/src/services/task-types.ts
 COPY patches/issues.ts /app/server/src/routes/issues.ts
+COPY patches/secrets-resolver.ts /app/server/src/services/secrets-resolver.ts
+COPY patches/blockers.ts /app/server/src/routes/blockers.ts
 # NOTE: guards.ts moved out of patches/ into server/src/services/ as part of
 # PR #19 (DEV-251) which removed CJS patching. It's now compiled by the base
 # paperclip:latest build and inherited here — no need to COPY it.
@@ -67,10 +75,17 @@ RUN cd /app/server && npx tsc 2>&1 || true \
     && grep -q "runGuards" /app/server/dist/services/guards.js \
     && grep -q "checkRequiredCredentials" /app/server/dist/routes/issues.js \
     && grep -q "CREDENTIAL_CAPABILITIES" /app/server/dist/services/task-types.js \
+    && grep -q "pasteKeysForCapabilities" /app/server/dist/services/task-types.js \
+    && grep -q "capabilitiesForPasteKey" /app/server/dist/services/task-types.js \
+    && grep -q "parseTelegramReply" /app/server/dist/services/secrets-resolver.js \
+    && grep -q "secretsResolverService" /app/server/dist/services/secrets-resolver.js \
+    && grep -q "blockers-webhook" /app/server/dist/routes/blockers.js \
     && node --check /app/server/dist/routes/issues.js \
+    && node --check /app/server/dist/routes/blockers.js \
     && node --check /app/server/dist/services/heartbeat.js \
     && node --check /app/server/dist/services/task-types.js \
     && node --check /app/server/dist/services/guards.js \
+    && node --check /app/server/dist/services/secrets-resolver.js \
     && echo "✓ all patches compiled; js parses cleanly"
 
 # PATCH 4.1: Patch compiled dashboard.js so monthSpend includes the

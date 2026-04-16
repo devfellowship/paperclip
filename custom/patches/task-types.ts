@@ -45,26 +45,73 @@ export interface CredentialCapability {
    * present.
    */
   envPatterns: RegExp[];
+  /**
+   * DEV-252: canonical env-var keys a human operator should paste to satisfy
+   * this capability. One line per key is surfaced in the Telegram blocker
+   * message as `paste: <KEY>=<value>`, and the secrets-resolver webhook
+   * accepts replies matching any of these keys. Most capabilities have a
+   * single key; Infisical machine identity needs two (client id + secret).
+   */
+  pasteKeys: string[];
 }
 
 export const CREDENTIAL_CAPABILITIES: Record<string, CredentialCapability> = {
   GITHUB_PAT_WITH_CONTENTS_WRITE: {
     description: "GitHub Personal Access Token with contents:write scope",
     envPatterns: [/^GITHUB_PAT/i, /^GH_PAT/i, /^GH_TOKEN$/i],
+    pasteKeys: ["GITHUB_PAT_BRO"],
   },
   SUPABASE_SERVICE_ROLE: {
     description: "Supabase service-role key",
     envPatterns: [/^SUPABASE_SERVICE_ROLE/i, /^SUPABASE_KEY/i],
+    pasteKeys: ["SUPABASE_SERVICE_ROLE"],
   },
   INFISICAL_MACHINE_IDENTITY: {
     description: "Infisical machine identity (INFISICAL_CLIENT_ID + INFISICAL_CLIENT_SECRET)",
     envPatterns: [/^INFISICAL_CLIENT_ID$/i],
+    pasteKeys: ["INFISICAL_CLIENT_ID", "INFISICAL_CLIENT_SECRET"],
   },
   NPM_TOKEN: {
     description: "npm publish token",
     envPatterns: [/^NPM_TOKEN/i],
+    pasteKeys: ["NPM_TOKEN"],
   },
 };
+
+/**
+ * DEV-252: returns the ordered list of canonical env keys for the given
+ * capability names, deduplicated. Used by the credential guard to build
+ * `paste: <KEY>=<value>` hints and by the secrets-resolver to validate that
+ * a pasted key actually belongs to a known capability.
+ */
+export function pasteKeysForCapabilities(capabilities: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const cap of capabilities) {
+    const entry = CREDENTIAL_CAPABILITIES[cap];
+    if (!entry) continue;
+    for (const key of entry.pasteKeys) {
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(key);
+    }
+  }
+  return out;
+}
+
+/**
+ * DEV-252: reverse lookup — given a pasted env key (e.g. "GITHUB_PAT_BRO"),
+ * return the names of every capability whose `pasteKeys` include it. The
+ * secrets-resolver uses this to decide whether a reply can satisfy an
+ * outstanding credential blocker.
+ */
+export function capabilitiesForPasteKey(pasteKey: string): string[] {
+  const out: string[] = [];
+  for (const [name, cap] of Object.entries(CREDENTIAL_CAPABILITIES)) {
+    if (cap.pasteKeys.includes(pasteKey)) out.push(name);
+  }
+  return out;
+}
 
 /**
  * Required credential capabilities per task type.
