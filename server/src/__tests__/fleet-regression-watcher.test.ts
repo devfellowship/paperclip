@@ -1,5 +1,5 @@
 /**
- * Unit tests for the fleet regression watcher (DEV-245, WS-1.a).
+ * Unit tests for the fleet regression watcher (DEV-245, WS-1.a, DEV-419).
  *
  * Strategy: we avoid the embedded-postgres test harness and instead inject a
  * fake Drizzle-shaped db + a fake issueService into reconcileFailingPRs.
@@ -14,11 +14,18 @@ import {
   buildDigest,
   buildIssueDescription,
   buildIssueTitle,
+  buildMainBranchIssueDescription,
+  buildMainBranchIssueTitle,
   computeDedupHash,
+  computeMainBranchDedupHash,
+  extractFailingMainBranches,
+  isMainBranchGreenInSnapshot,
   isPRGreenInSnapshot,
   reconcileFailingPRs,
   resolveAssignee,
+  type FailingMainBranch,
   type FailingPR,
+  type FleetSnapshot,
   type FleetWatcherDeps,
 } from "../services/fleet-regression-watcher.ts";
 
@@ -33,6 +40,8 @@ interface FakeIssueRow {
   githubPrNumber: number | null;
   status: string;
   description: string | null;
+  originKind: string | null;
+  originId: string | null;
 }
 
 interface FakeCommentRow {
@@ -54,10 +63,6 @@ function createFakeDb(state: {
   return {
     select(columns: Record<string, unknown>) {
       const columnKeys = Object.keys(columns);
-      const selectionMeta = {
-        wantsIssueCols:
-          columnKeys.includes("githubRepo") || columnKeys.includes("githubPrNumber") || columnKeys.includes("status") || columnKeys.includes("description"),
-      };
       let targetTable: unknown = null;
       let whereRepr: string = "";
       const builder: any = {
@@ -66,13 +71,8 @@ function createFakeDb(state: {
           return builder;
         },
         where(clause: unknown) {
-          // Drizzle SQL chunks have a .queryChunks array of sub-expressions.
-          // We serialize them via .toString() (avoids the circular ref that
-          // JSON.stringify hits on PgColumn/PgTable objects).
           try {
             whereRepr = String(clause ?? "");
-            // Also try to pull string/number literal values from nested
-            // params for robust matching.
             const extractParams = (node: any): string[] => {
               if (node == null) return [];
               if (typeof node === "string" || typeof node === "number") return [String(node)];
@@ -108,8 +108,6 @@ function createFakeDb(state: {
         const isCommentsTable = targetTable === issueComments;
         const isIssuesTable = targetTable === issues;
         if (isCommentsTable) {
-          // Comment idempotency lookup: filter by issueId + body substring
-          // appearing in whereRepr.
           return state.comments.filter((c) => {
             const issueIdMatch = whereRepr.includes(c.issueId);
             const bodySub = whereRepr.includes("CI now passing")
@@ -120,7 +118,7 @@ function createFakeDb(state: {
         }
         if (!isIssuesTable) return [];
 
-        // Three issue-query shapes; disambiguate by whereRepr contents + columns.
+        // Dedup marker lookup
         const markerMatch = whereRepr.match(/fleet-watcher-dedup:([a-f0-9]{8,32})/);
         if (markerMatch) {
           const marker = buildDedupMarker(markerMatch[1]!);
@@ -131,7 +129,23 @@ function createFakeDb(state: {
           );
         }
 
-        // Tracked-PR sweep asks for { id, githubRepo, githubPrNumber }
+        // Phase 2b: main-branch resolution sweep (originKind + originId LIKE %#main + NULL prNumber)
+        const isMainBranchSweep =
+          whereRepr.includes("fleet_watcher") &&
+          whereRepr.includes("#main") &&
+          !columnKeys.includes("githubPrNumber");
+        if (isMainBranchSweep) {
+          return state.issues.filter(
+            (i) =>
+              i.githubRepo != null &&
+              i.githubPrNumber == null &&
+              i.originKind === "fleet_watcher" &&
+              (i.originId ?? "").endsWith("#main") &&
+              OPEN_STATUSES.includes(i.status),
+          );
+        }
+
+        // Tracked-PR sweep (Phase 2): { id, githubRepo, githubPrNumber } with isNotNull
         const asksForSweepShape =
           columnKeys.includes("githubRepo") && columnKeys.includes("githubPrNumber");
         if (asksForSweepShape) {
@@ -143,7 +157,24 @@ function createFakeDb(state: {
           );
         }
 
-        // (repo, pr, open) lookup — whereRepr should mention repo + pr.
+        // Phase 1b: main-branch dedup by (repo, NULL prNumber)
+        // Detect: whereRepr has a repo name but the query uses isNull on prNumber
+        // We check if the query is looking for NULL prNumber by checking for
+        // issues with null prNumber matching the repo
+        const isMainBranchDedup = state.issues.some(
+          (i) => i.githubPrNumber == null && i.githubRepo != null &&
+            whereRepr.includes(i.githubRepo),
+        );
+        if (isMainBranchDedup) {
+          return state.issues.filter((i) => {
+            if (!i.githubRepo) return false;
+            if (i.githubPrNumber != null) return false;
+            if (!OPEN_STATUSES.includes(i.status)) return false;
+            return whereRepr.includes(i.githubRepo);
+          });
+        }
+
+        // (repo, pr, open) lookup — Phase 1 PR dedup
         return state.issues.filter((i) => {
           if (!i.githubRepo || i.githubPrNumber == null) return false;
           if (!OPEN_STATUSES.includes(i.status)) return false;
@@ -153,8 +184,6 @@ function createFakeDb(state: {
         });
       }
 
-      // Keep selectionMeta referenced to avoid unused-var lint noise
-      void selectionMeta;
       return builder;
     },
   };
@@ -166,6 +195,7 @@ function createFakeDb(state: {
 
 function makeDeps(opts: {
   failingPRs?: FailingPR[];
+  fleetSnapshot?: FleetSnapshot | null;
   existingIssues?: FakeIssueRow[];
   existingComments?: FakeCommentRow[];
 }): FleetWatcherDeps & { __created: FakeIssueRow[]; __comments: FakeCommentRow[] } {
@@ -185,6 +215,8 @@ function makeDeps(opts: {
         githubPrNumber: data.githubPrNumber ?? null,
         status: data.status ?? "todo",
         description: data.description ?? null,
+        originKind: data.originKind ?? null,
+        originId: data.originId ?? null,
       };
       state.issues.push(row);
       created.push(row);
@@ -204,7 +236,7 @@ function makeDeps(opts: {
 
   return {
     fetchFailingPRs: vi.fn(async () => opts.failingPRs ?? []),
-    fetchFleetSnapshot: vi.fn(async () => null),
+    fetchFleetSnapshot: vi.fn(async () => opts.fleetSnapshot ?? null),
     issues: fakeIssueService,
     db: createFakeDb(state) as any,
     companyId: "company-1",
@@ -275,6 +307,33 @@ describe("fleet-regression-watcher helpers", () => {
     expect(digest).toContain("2026-04-14");
   });
 
+  it("buildDigest includes main-branch count when provided", () => {
+    const now = new Date("2026-04-14T10:00:00Z");
+    const digest = buildDigest(
+      [{ repo: "devfellowship/dfl-hq", prNumber: 1 }],
+      1,
+      now,
+      3,
+      2,
+    );
+    expect(digest).toContain("1 red PR");
+    expect(digest).toContain("3 red main branches");
+    expect(digest).toContain("3 new tickets");
+  });
+
+  it("buildDigest omits main-branch part when zero", () => {
+    const now = new Date("2026-04-14T10:00:00Z");
+    const digest = buildDigest(
+      [{ repo: "devfellowship/dfl-hq", prNumber: 1 }],
+      1,
+      now,
+      0,
+      0,
+    );
+    expect(digest).not.toContain("main branch");
+    expect(digest).toContain("1 new ticket");
+  });
+
   it("isPRGreenInSnapshot finds a green PR and ignores failing ones", () => {
     const snap = {
       repos: [
@@ -295,7 +354,79 @@ describe("fleet-regression-watcher helpers", () => {
 });
 
 // ---------------------------------------------------------------------------
-// reconcileFailingPRs
+// Main-branch helper tests
+// ---------------------------------------------------------------------------
+
+describe("main-branch helpers", () => {
+  it("computeMainBranchDedupHash is stable and differs from PR hash", () => {
+    const h1 = computeMainBranchDedupHash("devfellowship/dfl-hq");
+    const h2 = computeMainBranchDedupHash("devfellowship/dfl-hq");
+    const h3 = computeMainBranchDedupHash("devfellowship/dfl-learn");
+    expect(h1).toBe(h2);
+    expect(h1).not.toBe(h3);
+    // Must differ from PR dedup hash for same repo
+    const prHash = computeDedupHash({ repo: "devfellowship/dfl-hq", prNumber: 0 });
+    expect(h1).not.toBe(prHash);
+  });
+
+  it("buildMainBranchIssueTitle formats correctly", () => {
+    expect(buildMainBranchIssueTitle("devfellowship/dfl-hq")).toBe(
+      "Fix failing CI: devfellowship/dfl-hq main branch",
+    );
+  });
+
+  it("buildMainBranchIssueDescription includes repo + dedup marker", () => {
+    const mb: FailingMainBranch = {
+      repo: "devfellowship/dfl-hq",
+      ciWorkflowName: "Vercel Deploy",
+      defaultBranch: "main",
+    };
+    const hash = computeMainBranchDedupHash(mb.repo);
+    const body = buildMainBranchIssueDescription(mb, hash);
+    expect(body).toContain("devfellowship/dfl-hq");
+    expect(body).toContain("Vercel Deploy");
+    expect(body).toContain("main (default)");
+    expect(body).toContain("Recovery procedure");
+    expect(body).toContain(buildDedupMarker(hash));
+  });
+
+  it("extractFailingMainBranches filters to ciStatus=failing", () => {
+    const snap: FleetSnapshot = {
+      repos: [
+        { fullName: "devfellowship/dfl-hq", ciStatus: "failing", ciWorkflowName: "CI" },
+        { fullName: "devfellowship/dfl-learn", ciStatus: "passing" },
+        { fullName: "devfellowship/dfl-iam", ciStatus: "failing", ciWorkflowName: "Vercel" },
+        { ciStatus: "failing" }, // no name — should be excluded
+      ],
+    };
+    const result = extractFailingMainBranches(snap);
+    expect(result).toHaveLength(2);
+    expect(result[0]!.repo).toBe("devfellowship/dfl-hq");
+    expect(result[1]!.repo).toBe("devfellowship/dfl-iam");
+  });
+
+  it("extractFailingMainBranches returns empty for null snapshot", () => {
+    expect(extractFailingMainBranches(null)).toHaveLength(0);
+  });
+
+  it("isMainBranchGreenInSnapshot checks ciStatus=passing", () => {
+    const snap: FleetSnapshot = {
+      repos: [
+        { fullName: "devfellowship/dfl-hq", ciStatus: "passing" },
+        { fullName: "devfellowship/dfl-learn", ciStatus: "failing" },
+        { fullName: "devfellowship/dfl-iam", ciStatus: "none" },
+      ],
+    };
+    expect(isMainBranchGreenInSnapshot(snap, "devfellowship/dfl-hq")).toBe(true);
+    expect(isMainBranchGreenInSnapshot(snap, "devfellowship/dfl-learn")).toBe(false);
+    expect(isMainBranchGreenInSnapshot(snap, "devfellowship/dfl-iam")).toBe(false);
+    expect(isMainBranchGreenInSnapshot(snap, "devfellowship/dfl-unknown")).toBe(false);
+    expect(isMainBranchGreenInSnapshot(null, "devfellowship/dfl-hq")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// reconcileFailingPRs — PR tests
 // ---------------------------------------------------------------------------
 
 describe("reconcileFailingPRs", () => {
@@ -304,6 +435,7 @@ describe("reconcileFailingPRs", () => {
     const result = await reconcileFailingPRs(deps);
     expect(result.opened).toBe(0);
     expect(result.resolved).toBe(0);
+    expect(result.mainBranchOpened).toBe(0);
     expect(deps.__created).toHaveLength(0);
     expect(deps.issues.create).not.toHaveBeenCalled();
   });
@@ -344,7 +476,6 @@ describe("reconcileFailingPRs", () => {
     const second = await reconcileFailingPRs(deps);
     expect(second.opened).toBe(0);
     expect(second.skipped).toBeGreaterThanOrEqual(1);
-    // No second issue created
     expect(deps.__created).toHaveLength(1);
   });
 
@@ -364,16 +495,153 @@ describe("reconcileFailingPRs", () => {
 
     expect(deps.issues.create).toHaveBeenCalledTimes(2);
     const calls = (deps.issues.create as ReturnType<typeof vi.fn>).mock.calls;
-    // infra repo → dfl-rollout-ops
     expect(calls[0][1]).toMatchObject({
       assigneeAgentId: "52b8e0f6-a267-40ed-9664-d8917f4495b5",
       priority: "high",
     });
-    // app repo → dfl-single-repo-impl
     expect(calls[1][1]).toMatchObject({
       assigneeAgentId: "bb604576-2eb5-4fd3-9088-a48e469e6432",
       priority: "high",
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// reconcileFailingPRs — main-branch tests (DEV-419)
+// ---------------------------------------------------------------------------
+
+describe("reconcileFailingPRs — main-branch tracking", () => {
+  it("failing main branch creates issue with correct title + assignee", async () => {
+    const snapshot: FleetSnapshot = {
+      repos: [
+        { fullName: "devfellowship/dfl-learn", ciStatus: "failing", ciWorkflowName: "Vercel Deploy", defaultBranch: "main" },
+      ],
+    };
+    const deps = makeDeps({ failingPRs: [], fleetSnapshot: snapshot });
+    const result = await reconcileFailingPRs(deps);
+    expect(result.mainBranchOpened).toBe(1);
+    expect(deps.__created).toHaveLength(1);
+    const created = deps.__created[0]!;
+    expect(created.githubRepo).toBe("devfellowship/dfl-learn");
+    expect(created.githubPrNumber).toBeNull();
+    expect(created.originKind).toBe("fleet_watcher");
+    expect(created.originId).toBe("devfellowship/dfl-learn#main");
+    expect(created.description).toContain("main (default)");
+
+    const calls = (deps.issues.create as ReturnType<typeof vi.fn>).mock.calls;
+    expect(calls[0][1]).toMatchObject({
+      title: "Fix failing CI: devfellowship/dfl-learn main branch",
+      assigneeAgentId: "bb604576-2eb5-4fd3-9088-a48e469e6432",
+      priority: "high",
+    });
+  });
+
+  it("main-branch issue is idempotent (running twice → still 1 issue)", async () => {
+    const snapshot: FleetSnapshot = {
+      repos: [
+        { fullName: "devfellowship/dfl-learn", ciStatus: "failing", ciWorkflowName: "CI" },
+      ],
+    };
+    const deps = makeDeps({ failingPRs: [], fleetSnapshot: snapshot });
+
+    const first = await reconcileFailingPRs(deps);
+    expect(first.mainBranchOpened).toBe(1);
+    expect(deps.__created).toHaveLength(1);
+
+    const second = await reconcileFailingPRs(deps);
+    expect(second.mainBranchOpened).toBe(0);
+    expect(second.mainBranchSkipped).toBeGreaterThanOrEqual(1);
+    expect(deps.__created).toHaveLength(1);
+  });
+
+  it("same repo red on both PR AND main gets 2 separate issues", async () => {
+    const snapshot: FleetSnapshot = {
+      repos: [
+        { fullName: "devfellowship/dfl-learn", ciStatus: "failing", ciWorkflowName: "CI" },
+      ],
+    };
+    const pr: FailingPR = {
+      repo: "devfellowship/dfl-learn",
+      prNumber: 5,
+      failedChecks: [{ name: "build" }],
+    };
+    const deps = makeDeps({ failingPRs: [pr], fleetSnapshot: snapshot });
+    const result = await reconcileFailingPRs(deps);
+    expect(result.opened).toBe(1);
+    expect(result.mainBranchOpened).toBe(1);
+    expect(deps.__created).toHaveLength(2);
+    // One PR issue, one main-branch issue
+    const prIssue = deps.__created.find((i) => i.githubPrNumber === 5);
+    const mainIssue = deps.__created.find((i) => i.githubPrNumber === null);
+    expect(prIssue).toBeDefined();
+    expect(mainIssue).toBeDefined();
+    expect(mainIssue!.originId).toBe("devfellowship/dfl-learn#main");
+  });
+
+  it("main branch green after fix → posts 'CI now passing' comment", async () => {
+    const existingIssue: FakeIssueRow = {
+      id: "issue-main-1",
+      companyId: "company-1",
+      githubRepo: "devfellowship/dfl-learn",
+      githubPrNumber: null,
+      status: "todo",
+      description: "some description",
+      originKind: "fleet_watcher",
+      originId: "devfellowship/dfl-learn#main",
+    };
+    const snapshot: FleetSnapshot = {
+      repos: [
+        { fullName: "devfellowship/dfl-learn", ciStatus: "passing" },
+      ],
+    };
+    const deps = makeDeps({
+      failingPRs: [],
+      fleetSnapshot: snapshot,
+      existingIssues: [existingIssue],
+    });
+    const result = await reconcileFailingPRs(deps);
+    expect(result.mainBranchResolved).toBe(1);
+    expect(deps.__comments).toHaveLength(1);
+    expect(deps.__comments[0]!.body).toContain("Main branch CI now passing");
+  });
+
+  it("main branch still failing → no comment posted", async () => {
+    const existingIssue: FakeIssueRow = {
+      id: "issue-main-1",
+      companyId: "company-1",
+      githubRepo: "devfellowship/dfl-learn",
+      githubPrNumber: null,
+      status: "todo",
+      description: "some description",
+      originKind: "fleet_watcher",
+      originId: "devfellowship/dfl-learn#main",
+    };
+    const snapshot: FleetSnapshot = {
+      repos: [
+        { fullName: "devfellowship/dfl-learn", ciStatus: "failing" },
+      ],
+    };
+    const deps = makeDeps({
+      failingPRs: [],
+      fleetSnapshot: snapshot,
+      existingIssues: [existingIssue],
+    });
+    const result = await reconcileFailingPRs(deps);
+    expect(result.mainBranchResolved).toBe(0);
+    expect(deps.__comments).toHaveLength(0);
+  });
+
+  it("digest includes main-branch counts", async () => {
+    const snapshot: FleetSnapshot = {
+      repos: [
+        { fullName: "devfellowship/dfl-learn", ciStatus: "failing", ciWorkflowName: "CI" },
+        { fullName: "devfellowship/dfl-iam", ciStatus: "failing", ciWorkflowName: "CI" },
+      ],
+    };
+    const deps = makeDeps({ failingPRs: [], fleetSnapshot: snapshot });
+    const result = await reconcileFailingPRs(deps);
+    expect(result.digest).toContain("2 red main branches");
+    expect(result.digest).toContain("2 new tickets");
   });
 });
 
