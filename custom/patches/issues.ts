@@ -51,7 +51,7 @@ import { forbidden, HttpError, unauthorized } from "../errors.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
 import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
 import { runGuards } from "../services/guards.js";
-import { checkRequiredCredentials } from "../services/task-types.js";
+import { checkRequiredCredentials, pasteKeysForCapabilities } from "../services/task-types.js";
 import {
   isInlineAttachmentContentType,
   MAX_ATTACHMENT_BYTES,
@@ -2005,11 +2005,21 @@ export function issueRoutes(
         const credCheck = checkRequiredCredentials(updated.taskType, agentEnvKeys, requiredOverride);
         if (!credCheck.ok) {
           const missingList = credCheck.missing.join(", ");
+          // DEV-252: build `paste: KEY=<value>` hints so the operator can reply
+          // in the Telegram blocker thread and have the secret stored via the
+          // secrets-resolver webhook automatically.
+          const pasteKeys = pasteKeysForCapabilities(credCheck.missing);
+          const pasteLines = pasteKeys.length > 0
+            ? pasteKeys.map((k) => "paste: " + k + "=<value>").join("\n")
+            : "paste: <VAR>=<value>";
           const blockedComment =
             "Credential guard blocked task start.\n\n" +
             "Missing credentials: **" + missingList + "**\n\n" +
-            "Add these to the agent Infisical path (`/agents/<name>/`) or adapterConfig.env, " +
-            "then re-checkout.\n\nsecrets:need " + missingList;
+            "Reply in the #blockers Telegram thread with one line per secret:\n\n" +
+            "```\n" + pasteLines + "\n```\n\n" +
+            "Paperclip will write the value to Infisical `/agents/<name>/` and " +
+            "auto-resume this task. Alternatively, add them to adapterConfig.env " +
+            "and re-checkout.";
           await svc
             .update(updated.id, { status: "blocked", actorAgentId: req.body.agentId })
             .catch((err: unknown) =>
@@ -2028,7 +2038,14 @@ export function issueRoutes(
               taskId: updated.id,
               agentId: req.body.agentId,
               summary: "Credential guard: missing " + missingList,
-              needs: "Provision in Infisical /agents/<name>/: " + missingList,
+              // DEV-252: the `needs` body is what renders inside the Telegram
+              // blocker post. Including the paste hints here makes the thread
+              // self-explanatory and gives the secrets-resolver a known shape
+              // to match against. Keep `secrets:need <caps>` as a grep anchor
+              // so the resolver can also locate blockers by capability name.
+              needs:
+                "secrets:need " + missingList + "\n\n" +
+                "Reply here with:\n" + pasteLines,
               context:
                 "Checkout blocked for " +
                 (updated.identifier ?? updated.id) +
