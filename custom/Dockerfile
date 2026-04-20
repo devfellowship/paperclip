@@ -92,7 +92,7 @@ RUN cd /app/server && npx tsc 2>&1 || true \
 # equivalent_api_cost_cents column (which heartbeat.ts now populates for
 # subscription_included rows). cost_events is the only table in the FROM,
 # so the unqualified column name resolves cleanly.
-RUN sed -i 's|coalesce(sum(${costEvents.costCents}), 0)::int|coalesce(sum(${costEvents.costCents} + coalesce(equivalent_api_cost_cents, 0)), 0)::int|' \
+RUN sed -i 's|coalesce(sum(${costEvents.costCents}), 0)::double precision|coalesce(sum(${costEvents.costCents} + coalesce(equivalent_api_cost_cents, 0)), 0)::double precision|' \
     /app/server/dist/services/dashboard.js \
     && grep -q "equivalent_api_cost_cents" /app/server/dist/services/dashboard.js \
     && echo "✓ dashboard.js patched to include equivalent_api_cost_cents"
