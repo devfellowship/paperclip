@@ -3,7 +3,7 @@ import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import { validate } from "../middleware/validate.js";
 import { blockerService } from "../services/blockers.js";
-import { issueService } from "../services/index.js";
+import { issueService, agentService } from "../services/index.js";
 import { logger } from "../middleware/logger.js";
 
 const createBlockerSchema = z.object({
@@ -18,14 +18,16 @@ export function blockerRoutes(db: Db) {
   const router = Router();
   const svc = blockerService(db);
   const issueSvc = issueService(db);
+  const agentSvc = agentService(db);
 
   router.post("/blockers", validate(createBlockerSchema), async (req, res) => {
     try {
       const { taskId, agentId, summary, needs, context } = req.body;
 
-      // Try to fetch issue title and identifier for a richer Telegram message
+      // Try to fetch issue title/identifier and agent name for a richer Telegram message
       let issueTitle: string | undefined;
       let issueIdentifier: string | undefined;
+      let agentName: string | undefined;
       try {
         const issue = await issueSvc.getById(taskId);
         if (issue) {
@@ -34,6 +36,12 @@ export function blockerRoutes(db: Db) {
         }
       } catch {
         // Non-critical — proceed without title
+      }
+      try {
+        const agent = await agentSvc.getById(agentId);
+        if (agent) agentName = agent.name;
+      } catch {
+        // Non-critical — proceed without agent name
       }
 
       const result = await svc.create({
@@ -44,6 +52,7 @@ export function blockerRoutes(db: Db) {
         context,
         issueTitle,
         issueIdentifier,
+        agentName,
       });
 
       res.status(result.posted ? 201 : 200).json(result);

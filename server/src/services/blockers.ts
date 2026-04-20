@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { eq, and, gt, isNull, sql } from "drizzle-orm";
-import { blockerNotifications } from "@paperclipai/db";
+import { blockerNotifications, issues, agents } from "@paperclipai/db";
 import type { Db } from "@paperclipai/db";
 import { scrubCredentials } from "./blocker-credential-scrubber.js";
 import { logger } from "../middleware/logger.js";
@@ -26,6 +26,12 @@ function truncateToLines(text: string, maxLines: number): string {
   const lines = text.split("\n");
   if (lines.length <= maxLines) return text;
   return lines.slice(0, maxLines).join("\n") + "...";
+}
+
+function buildIssueUrl(identifier: string): string {
+  const baseUrl = process.env.PAPERCLIP_PUBLIC_URL ?? "https://app.paperclip.ing";
+  const prefix = identifier.split("-")[0];
+  return `${baseUrl}/${prefix}/issues/${identifier}`;
 }
 
 async function sendTelegramMessage(text: string): Promise<number | null> {
@@ -102,6 +108,7 @@ export function blockerService(db: Db) {
       context?: string;
       issueTitle?: string;
       issueIdentifier?: string;
+      agentName?: string;
     }) {
       const blockerHash = computeBlockerHash(input.taskId, input.needs);
       const dedupCutoff = new Date(Date.now() - DEDUP_WINDOW_MS);
@@ -136,16 +143,18 @@ export function blockerService(db: Db) {
 
       // Build the issue URL
       const issueIdentifier = input.issueIdentifier ?? input.taskId;
-      const issueUrl = `https://paperclip.devfellowship.com/issues/${issueIdentifier}`;
+      const issueUrl = input.issueIdentifier ? buildIssueUrl(input.issueIdentifier) : null;
+      const displayName = input.agentName ?? input.agentId;
       const titlePart = input.issueTitle ? ` ${input.issueTitle} ·` : "";
 
       // Format Telegram message
       const contextLine = scrubbedContext
         ? `\ncontext: ${truncateToLines(scrubbedContext, 3)}`
         : "";
+      const taskLine = issueUrl ? `task:${titlePart} ${issueUrl}` : `task:${titlePart} ${issueIdentifier}`;
       const telegramText = [
-        `\u{1F6A7} ${input.agentId} blocked on ${issueIdentifier}`,
-        `task:${titlePart} ${issueUrl}`,
+        `\u{1F6A7} ${displayName} blocked on ${issueIdentifier}`,
+        taskLine,
         `needs: ${scrubbedNeeds}`,
         ...(contextLine ? [contextLine.trim()] : []),
       ].join("\n");
@@ -204,10 +213,22 @@ export function blockerService(db: Db) {
 
       // Edit Telegram message to resolved
       if (existing.telegramMsgId != null) {
-        const issueUrl = `https://paperclip.devfellowship.com/issues/${existing.taskId}`;
+        let agentName = existing.agentId;
+        let issueIdentifier = existing.taskId;
+        try {
+          const [agent] = await db.select({ name: agents.name }).from(agents).where(eq(agents.id, existing.agentId));
+          if (agent?.name) agentName = agent.name;
+        } catch { /* non-critical */ }
+        try {
+          const [issue] = await db.select({ identifier: issues.identifier }).from(issues).where(eq(issues.id, existing.taskId));
+          if (issue?.identifier) issueIdentifier = issue.identifier;
+        } catch { /* non-critical */ }
+
+        const issueUrl = issueIdentifier !== existing.taskId ? buildIssueUrl(issueIdentifier) : null;
+        const taskLine = issueUrl ? `task: ${issueUrl}` : `task: ${issueIdentifier}`;
         const resolvedText = [
-          `\u2705 Resolved: ${existing.agentId} on ${existing.taskId}`,
-          `task: ${issueUrl}`,
+          `\u2705 Resolved: ${agentName} on ${issueIdentifier}`,
+          taskLine,
           `was: ${existing.needs}`,
         ].join("\n");
         await editTelegramMessage(Number(existing.telegramMsgId), resolvedText);
