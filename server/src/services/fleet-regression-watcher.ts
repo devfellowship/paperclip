@@ -201,14 +201,30 @@ async function defaultFetchJson<T>(url: string): Promise<T | null> {
 }
 
 export async function fetchFailingPRs(): Promise<FailingPR[]> {
-  const data = await defaultFetchJson<FailingPR[]>(FLEET_HEALTH_FAILING_PRS_URL);
-  if (!Array.isArray(data)) return [];
-  return data.filter(
+  const data = await defaultFetchJson<FailingPR[] | { prs?: FailingPR[]; total?: number }>(
+    FLEET_HEALTH_FAILING_PRS_URL,
+  );
+  // Accept both bare array and { prs: [...] } envelope shapes
+  const rows: unknown[] = Array.isArray(data)
+    ? data
+    : (data as any)?.prs != null && Array.isArray((data as any).prs)
+      ? (data as any).prs
+      : [];
+  if (rows.length === 0 && data != null && typeof data === "object" && !Array.isArray(data)) {
+    const total = (data as any).total;
+    if (typeof total === "number" && total > 0) {
+      logger.warn(
+        { url: FLEET_HEALTH_FAILING_PRS_URL, envelopeTotal: total, extractedCount: 0 },
+        "fleet-watcher: envelope total > 0 but extracted 0 PRs — possible shape drift",
+      );
+    }
+  }
+  return rows.filter(
     (row): row is FailingPR =>
       row != null &&
       typeof row === "object" &&
-      typeof row.repo === "string" &&
-      typeof row.prNumber === "number",
+      typeof (row as any).repo === "string" &&
+      typeof (row as any).prNumber === "number",
   );
 }
 
