@@ -1,11 +1,86 @@
 import { createHash } from "node:crypto";
 import { eq, and, gt, isNull, sql } from "drizzle-orm";
-import { blockerNotifications } from "@paperclipai/db";
+import { blockerNotifications, agents, issues, companies } from "@paperclipai/db";
 import type { Db } from "@paperclipai/db";
 import { scrubCredentials } from "./blocker-credential-scrubber.js";
 import { logger } from "../middleware/logger.js";
 
 const DEDUP_WINDOW_MS = 60 * 60 * 1000; // 1 hour
+
+/**
+ * Base URL for the Paperclip UI, used when building clickable issue links in
+ * blocker notifications. Falls back to the canonical public hostname. If the
+ * env var is explicitly set to an empty string, no URL line is included.
+ */
+export function getPublicUrlBase(): string | null {
+  const raw = process.env.PAPERCLIP_PUBLIC_URL;
+  if (raw === undefined) {
+    // No env configured: default to the canonical public host
+    return "https://ppclip.tainanfidelis.com";
+  }
+  const trimmed = raw.trim().replace(/\/+$/, "");
+  if (trimmed.length === 0) return null;
+  return trimmed;
+}
+
+/**
+ * Build a URL to an issue in the Paperclip UI. Returns null if we don't have
+ * enough info to produce a working link (no base, no prefix, or no identifier).
+ *
+ * URL shape: `${base}/${companyPrefix}/issues/${issueIdentifier}` — matches
+ * the UI route `/:companyPrefix/issues/:id`.
+ */
+export function buildIssueUrl(
+  base: string | null,
+  companyPrefix: string | null | undefined,
+  issueIdentifier: string | null | undefined,
+): string | null {
+  if (!base) return null;
+  if (!companyPrefix || !issueIdentifier) return null;
+  return `${base}/${companyPrefix}/issues/${issueIdentifier}`;
+}
+
+/** Render the Telegram text for a newly-posted blocker. */
+export function formatBlockedMessage(input: {
+  agentName: string;
+  issueLabel: string;
+  issueTitle?: string | null;
+  issueUrl: string | null;
+  needs: string;
+  context?: string | null;
+}): string {
+  const lines: string[] = [
+    `\u{1F6A7} ${input.agentName} blocked on ${input.issueLabel}`,
+  ];
+  if (input.issueUrl) {
+    const titlePart = input.issueTitle ? ` ${input.issueTitle} \u00B7` : "";
+    lines.push(`task:${titlePart} ${input.issueUrl}`);
+  } else if (input.issueTitle) {
+    lines.push(`task: ${input.issueTitle}`);
+  }
+  lines.push(`needs: ${input.needs}`);
+  if (input.context) {
+    lines.push(`context: ${input.context}`);
+  }
+  return lines.join("\n");
+}
+
+/** Render the Telegram text for a resolved blocker. */
+export function formatResolvedMessage(input: {
+  agentName: string;
+  issueLabel: string;
+  issueUrl: string | null;
+  summary: string;
+}): string {
+  const lines: string[] = [
+    `\u2705 Resolved: ${input.agentName} unblocked on ${input.issueLabel}`,
+  ];
+  if (input.issueUrl) {
+    lines.push(input.issueUrl);
+  }
+  lines.push(`was: ${input.summary}`);
+  return lines.join("\n");
+}
 
 /** Convert BigInt fields to Number for JSON serialization */
 function toJsonSafe<T extends Record<string, unknown>>(row: T): T {
@@ -92,6 +167,80 @@ async function editTelegramMessage(messageId: number, text: string): Promise<boo
   return true;
 }
 
+/**
+ * Look up human-friendly labels we use in Telegram messages. We avoid raw
+ * UUIDs because they aren't actionable for the human reader.
+ *
+ * Falls back gracefully (agent name → short agent id suffix, issue identifier
+ * → short task id suffix) so we always produce *some* reasonable text.
+ */
+async function loadMessageContext(
+  db: Db,
+  taskId: string,
+  agentId: string,
+): Promise<{
+  agentName: string;
+  issueIdentifier: string | null;
+  issueTitle: string | null;
+  companyPrefix: string | null;
+}> {
+  let agentName: string | null = null;
+  let issueIdentifier: string | null = null;
+  let issueTitle: string | null = null;
+  let companyId: string | null = null;
+  let companyPrefix: string | null = null;
+
+  try {
+    const row = await db
+      .select({ name: agents.name })
+      .from(agents)
+      .where(eq(agents.id, agentId))
+      .then((rows) => rows[0] ?? null);
+    agentName = row?.name ?? null;
+  } catch (err) {
+    logger.warn({ err, agentId }, "blockers: failed to resolve agent name");
+  }
+
+  try {
+    const row = await db
+      .select({
+        identifier: issues.identifier,
+        title: issues.title,
+        companyId: issues.companyId,
+      })
+      .from(issues)
+      .where(eq(issues.id, taskId))
+      .then((rows) => rows[0] ?? null);
+    if (row) {
+      issueIdentifier = row.identifier ?? null;
+      issueTitle = row.title ?? null;
+      companyId = row.companyId;
+    }
+  } catch (err) {
+    logger.warn({ err, taskId }, "blockers: failed to resolve issue identifier");
+  }
+
+  if (companyId) {
+    try {
+      const row = await db
+        .select({ issuePrefix: companies.issuePrefix })
+        .from(companies)
+        .where(eq(companies.id, companyId))
+        .then((rows) => rows[0] ?? null);
+      companyPrefix = row?.issuePrefix ?? null;
+    } catch (err) {
+      logger.warn({ err, companyId }, "blockers: failed to resolve company prefix");
+    }
+  }
+
+  return {
+    agentName: agentName ?? "agent",
+    issueIdentifier,
+    issueTitle,
+    companyPrefix,
+  };
+}
+
 export function blockerService(db: Db) {
   return {
     async create(input: {
@@ -134,21 +283,23 @@ export function blockerService(db: Db) {
       const scrubbedNeeds = scrubCredentials(input.needs);
       const scrubbedContext = input.context ? scrubCredentials(input.context) : null;
 
-      // Build the issue URL
-      const issueIdentifier = input.issueIdentifier ?? input.taskId;
-      const issueUrl = `https://paperclip.devfellowship.com/issues/${issueIdentifier}`;
-      const titlePart = input.issueTitle ? ` ${input.issueTitle} ·` : "";
+      // Look up human-friendly labels (agent name, DEV-### identifier, company prefix).
+      // The caller may have supplied a title/identifier; prefer those but fall back to DB.
+      const ctx = await loadMessageContext(db, input.taskId, input.agentId);
+      const issueIdentifier = input.issueIdentifier ?? ctx.issueIdentifier;
+      const issueTitle = input.issueTitle ?? ctx.issueTitle;
+      const issueLabel = issueIdentifier ?? `task ${input.taskId.slice(0, 8)}`;
 
-      // Format Telegram message
-      const contextLine = scrubbedContext
-        ? `\ncontext: ${truncateToLines(scrubbedContext, 3)}`
-        : "";
-      const telegramText = [
-        `\u{1F6A7} ${input.agentId} blocked on ${issueIdentifier}`,
-        `task:${titlePart} ${issueUrl}`,
-        `needs: ${scrubbedNeeds}`,
-        ...(contextLine ? [contextLine.trim()] : []),
-      ].join("\n");
+      const issueUrl = buildIssueUrl(getPublicUrlBase(), ctx.companyPrefix, issueIdentifier);
+
+      const telegramText = formatBlockedMessage({
+        agentName: ctx.agentName,
+        issueLabel,
+        issueTitle,
+        issueUrl,
+        needs: scrubbedNeeds,
+        context: scrubbedContext ? truncateToLines(scrubbedContext, 3) : null,
+      });
 
       // Send to Telegram
       const telegramMsgId = await sendTelegramMessage(telegramText);
@@ -204,12 +355,18 @@ export function blockerService(db: Db) {
 
       // Edit Telegram message to resolved
       if (existing.telegramMsgId != null) {
-        const issueUrl = `https://paperclip.devfellowship.com/issues/${existing.taskId}`;
-        const resolvedText = [
-          `\u2705 Resolved: ${existing.agentId} on ${existing.taskId}`,
-          `task: ${issueUrl}`,
-          `was: ${existing.needs}`,
-        ].join("\n");
+        const ctx = await loadMessageContext(db, existing.taskId, existing.agentId);
+        const issueLabel = ctx.issueIdentifier ?? `task ${existing.taskId.slice(0, 8)}`;
+        const issueUrl = buildIssueUrl(getPublicUrlBase(), ctx.companyPrefix, ctx.issueIdentifier);
+        // Prefer the original blocker summary (short, human-written) over `needs`
+        // which is often a verbose internal error dump.
+        const summary = existing.summary || existing.needs;
+        const resolvedText = formatResolvedMessage({
+          agentName: ctx.agentName,
+          issueLabel,
+          issueUrl,
+          summary,
+        });
         await editTelegramMessage(Number(existing.telegramMsgId), resolvedText);
       }
 
