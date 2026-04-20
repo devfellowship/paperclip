@@ -109,6 +109,46 @@ const OPEN_ISSUE_STATUSES = [
 ] as const;
 
 // ---------------------------------------------------------------------------
+// Assignee routing
+// ---------------------------------------------------------------------------
+
+const INFRA_REPOS = new Set([
+  "dfl-ci",
+  "dfl-harness",
+  "dfl-infra",
+  "dfl-fleet-health",
+  "dfl-sandbox-manager",
+]);
+
+const DEFAULT_ASSIGNEE_MAP: Record<string, string> = {
+  infra: "52b8e0f6-a267-40ed-9664-d8917f4495b5",   // dfl-rollout-ops
+  app:   "bb604576-2eb5-4fd3-9088-a48e469e6432",     // dfl-single-repo-impl
+};
+
+function loadAssigneeMap(): Record<string, string> {
+  const raw = process.env.FLEET_WATCHER_ASSIGNEE_MAP_JSON;
+  if (!raw) return DEFAULT_ASSIGNEE_MAP;
+  try {
+    return JSON.parse(raw) as Record<string, string>;
+  } catch {
+    logger.warn("fleet-watcher: invalid FLEET_WATCHER_ASSIGNEE_MAP_JSON, using defaults");
+    return DEFAULT_ASSIGNEE_MAP;
+  }
+}
+
+export function resolveAssignee(repoFullName: string): string | undefined {
+  const map = loadAssigneeMap();
+  const shortName = repoFullName.includes("/")
+    ? repoFullName.split("/").pop()!
+    : repoFullName;
+
+  if (!shortName.startsWith("dfl-")) return undefined;
+
+  if (INFRA_REPOS.has(shortName)) return map.infra;
+  return map.app;
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -317,12 +357,14 @@ export async function reconcileFailingPRs(
 
       const title = buildIssueTitle(pr);
       const description = buildIssueDescription(pr, dedupHash);
+      const assigneeAgentId = resolveAssignee(pr.repo);
 
       await deps.issues.create(deps.companyId, {
         title,
         description,
         status: "todo",
-        priority: "medium",
+        priority: "high",
+        assigneeAgentId,
         githubRepo: pr.repo,
         githubPrNumber: pr.prNumber,
         originKind: "fleet_watcher",

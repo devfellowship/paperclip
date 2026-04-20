@@ -17,6 +17,7 @@ import {
   computeDedupHash,
   isPRGreenInSnapshot,
   reconcileFailingPRs,
+  resolveAssignee,
   type FailingPR,
   type FleetWatcherDeps,
 } from "../services/fleet-regression-watcher.ts";
@@ -345,5 +346,67 @@ describe("reconcileFailingPRs", () => {
     expect(second.skipped).toBeGreaterThanOrEqual(1);
     // No second issue created
     expect(deps.__created).toHaveLength(1);
+  });
+
+  it("new issue gets assigneeAgentId from repo routing and priority high", async () => {
+    const infraPr: FailingPR = {
+      repo: "devfellowship/dfl-ci",
+      prNumber: 10,
+      failedChecks: [{ name: "build" }],
+    };
+    const appPr: FailingPR = {
+      repo: "devfellowship/dfl-learn",
+      prNumber: 20,
+      failedChecks: [{ name: "test" }],
+    };
+    const deps = makeDeps({ failingPRs: [infraPr, appPr] });
+    await reconcileFailingPRs(deps);
+
+    expect(deps.issues.create).toHaveBeenCalledTimes(2);
+    const calls = (deps.issues.create as ReturnType<typeof vi.fn>).mock.calls;
+    // infra repo → dfl-rollout-ops
+    expect(calls[0][1]).toMatchObject({
+      assigneeAgentId: "52b8e0f6-a267-40ed-9664-d8917f4495b5",
+      priority: "high",
+    });
+    // app repo → dfl-single-repo-impl
+    expect(calls[1][1]).toMatchObject({
+      assigneeAgentId: "bb604576-2eb5-4fd3-9088-a48e469e6432",
+      priority: "high",
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveAssignee routing
+// ---------------------------------------------------------------------------
+
+describe("resolveAssignee", () => {
+  it("routes infra repos to dfl-rollout-ops", () => {
+    for (const repo of [
+      "devfellowship/dfl-ci",
+      "devfellowship/dfl-harness",
+      "devfellowship/dfl-infra",
+      "devfellowship/dfl-fleet-health",
+      "devfellowship/dfl-sandbox-manager",
+    ]) {
+      expect(resolveAssignee(repo)).toBe("52b8e0f6-a267-40ed-9664-d8917f4495b5");
+    }
+  });
+
+  it("routes app dfl-* repos to dfl-single-repo-impl", () => {
+    for (const repo of [
+      "devfellowship/dfl-learn",
+      "devfellowship/dfl-hq",
+      "devfellowship/dfl-mcp-server",
+      "devfellowship/dfl-schema",
+    ]) {
+      expect(resolveAssignee(repo)).toBe("bb604576-2eb5-4fd3-9088-a48e469e6432");
+    }
+  });
+
+  it("returns undefined for non-dfl repos", () => {
+    expect(resolveAssignee("paperclipai/paperclip")).toBeUndefined();
+    expect(resolveAssignee("devfellowship/other-tool")).toBeUndefined();
   });
 });
