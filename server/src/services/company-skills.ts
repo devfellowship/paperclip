@@ -956,39 +956,10 @@ async function readLocalSkillImports(companyId: string, sourcePath: string): Pro
   }
 
   if (stat.isFile()) {
-    const markdown = await fs.readFile(resolvedPath, "utf8");
-    const parsed = parseFrontmatterMarkdown(markdown);
-    const slug = deriveImportedSkillSlug(parsed.frontmatter, path.basename(path.dirname(resolvedPath)));
-    const parsedMetadata = isPlainRecord(parsed.frontmatter.metadata) ? parsed.frontmatter.metadata : null;
-    const skillKey = readCanonicalSkillKey(parsed.frontmatter, parsedMetadata);
-    const metadata = {
-      ...(skillKey ? { skillKey } : {}),
-      ...(parsedMetadata ?? {}),
-      sourceKind: "local_path",
-    };
-    const inventory: CompanySkillFileInventoryEntry[] = [
-      { path: "SKILL.md", kind: "skill" },
-    ];
-    return [{
-      key: deriveCanonicalSkillKey(companyId, {
-        slug,
-        sourceType: "local_path",
-        sourceLocator: path.dirname(resolvedPath),
-        metadata,
-      }),
-      slug,
-      name: asString(parsed.frontmatter.name) ?? slug,
-      description: asString(parsed.frontmatter.description),
-      markdown,
-      packageDir: path.dirname(resolvedPath),
-      sourceType: "local_path",
-      sourceLocator: path.dirname(resolvedPath),
-      sourceRef: null,
-      trustLevel: deriveTrustLevel(inventory),
-      compatibility: "compatible",
-      fileInventory: inventory,
-      metadata,
-    }];
+    // The path points to a SKILL.md file; delegate to the directory-aware helper
+    // so sibling files (scripts, references, examples) are included in the
+    // inventory rather than hardcoded to `[{ path: "SKILL.md" }]`. DEV-374.
+    return [await readLocalSkillImportFromDirectory(companyId, path.dirname(resolvedPath))];
   }
 
   const root = resolvedPath;
