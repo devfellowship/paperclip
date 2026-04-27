@@ -2,7 +2,7 @@
 Description=PostgreSQL for Paperclip
 
 [Container]
-Image=docker.io/library/postgres:17-alpine
+Image=docker.io/pgvector/pgvector:pg17
 ContainerName=paperclip-db
 Pod=paperclip.pod
 Volume=paperclip-pgdata:/var/lib/postgresql/data
