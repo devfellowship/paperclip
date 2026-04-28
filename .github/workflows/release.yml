@@ -63,7 +63,11 @@ jobs:
         run: pnpm build
 
   publish_canary:
-    if: github.event_name == 'push'
+    # Skip on forks — only paperclipai/paperclip has the npm-canary registry
+    # credentials. On forks (devfellowship/paperclip), this job fails with
+    # ENEEDAUTH on every master push, polluting CI signal. verify_canary still
+    # runs to catch breakage in the canary build pipeline itself.
+    if: github.event_name == 'push' && github.repository == 'paperclipai/paperclip'
     needs: verify_canary
     runs-on: ubuntu-latest
     timeout-minutes: 45
