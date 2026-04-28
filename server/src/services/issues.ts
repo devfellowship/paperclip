@@ -1281,6 +1281,8 @@ const issueListSelect = {
   hiddenAt: issues.hiddenAt,
   createdAt: issues.createdAt,
   updatedAt: issues.updatedAt,
+  githubRepo: issues.githubRepo,
+  githubPrNumber: issues.githubPrNumber,
 };
 
 function withActiveRuns(
