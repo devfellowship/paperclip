@@ -689,6 +689,7 @@ export async function startServer(): Promise<StartedServer> {
         const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
         if (
           promotion.promoted > 0 ||
+          reconciled.assignmentDispatched > 0 ||
           reconciled.dispatchRequeued > 0 ||
           reconciled.continuationRequeued > 0 ||
           reconciled.escalated > 0
@@ -747,6 +748,7 @@ export async function startServer(): Promise<StartedServer> {
           const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
           if (
             promotion.promoted > 0 ||
+            reconciled.assignmentDispatched > 0 ||
             reconciled.dispatchRequeued > 0 ||
             reconciled.continuationRequeued > 0 ||
             reconciled.escalated > 0
