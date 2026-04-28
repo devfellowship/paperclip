@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://paperclip.devfellowship.com/schemas/task-types/multi-repo-rollout.json",
+  "title": "multi-repo-rollout",
+  "description": "Completion report schema for the multi-repo-rollout Harness v2 task type. Produced by invokeMultiGitter(); validated by validateCompletionReport() in task-types.ts and by the requireRepoCoverage guard.",
+  "type": "object",
+  "required": [
+    "repos_targeted",
+    "repos_succeeded",
+    "repos_failed",
+    "pr_urls",
+    "summary",
+    "validation_evidence"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "repos_targeted": {
+      "type": "array",
+      "description": "GitHub org/repo slugs that were targeted by the rollout.",
+      "items": { "type": "string", "minLength": 3 },
+      "minItems": 1
+    },
+    "repos_succeeded": {
+      "type": "array",
+      "description": "Repos where a PR was opened (or already existed).",
+      "items": { "type": "string", "minLength": 3 }
+    },
+    "repos_failed": {
+      "type": "array",
+      "description": "Repos where the rollout failed or the script exited non-zero.",
+      "items": { "type": "string", "minLength": 3 }
+    },
+    "pr_urls": {
+      "type": "array",
+      "description": "One GitHub pull-request URL per succeeded repo.",
+      "items": {
+        "type": "string",
+        "pattern": "^https://github\\.com/[\\w.-]+/[\\w.-]+/pull/\\d+$"
+      }
+    },
+    "summary": {
+      "type": "string",
+      "description": "Human-readable summary: coverage fraction, success criteria, failed repos.",
+      "minLength": 10
+    },
+    "validation_evidence": {
+      "type": "string",
+      "description": "PR URLs + any stderr tail from multi-gitter for audit trail.",
+      "minLength": 1
+    }
+  },
+  "x-guard-rule": {
+    "requireRepoCoverage": "len(repos_succeeded) + len(repos_failed) MUST equal len(repos_targeted). No silent drops.",
+    "agent": "dfl-rollout-ops"
+  }
+}

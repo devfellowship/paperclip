@@ -89,6 +89,8 @@ import {
 } from "./issue-continuation-summary.js";
 import { executionWorkspaceService, mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { workspaceOperationService } from "./workspace-operations.js";
+import { gatherContextPacket } from "./context-gathering.js";
+import { getTracer, redactAttrs } from "../otel.js";
 import { isProcessGroupAlive, terminateLocalService } from "./local-service-supervisor.js";
 import {
   buildExecutionWorkspaceAdapterConfig,
@@ -5480,30 +5482,129 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           "local agent jwt secret missing or invalid; running without injected PAPERCLIP_API_KEY",
         );
       }
-      const adapterResult = await adapter.execute({
-        runId: run.id,
-        agent,
-        runtime: runtimeForAdapter,
-        config: runtimeConfig,
-        context,
-        executionTarget,
-        executionTransport: remoteExecution
-          ? { remoteExecution: remoteExecution as unknown as Record<string, unknown> }
-          : undefined,
-        onLog,
-        onMeta: onAdapterMeta,
-        onSpawn: async (meta) => {
-          await persistRunProcessMetadata(run.id, {
-            pid: meta.pid,
-            processGroupId:
-              "processGroupId" in meta && typeof meta.processGroupId === "number"
-                ? meta.processGroupId
-                : null,
-            startedAt: meta.startedAt,
+      // DEV-247 / WS-2: write a pre-task context packet so agents start with
+      // real state instead of burning LLM tool calls to re-discover it.
+      // Non-fatal: any failure here must NEVER block adapter.execute.
+      if (issueRef && executionWorkspace.cwd) {
+        try {
+          const packet = await gatherContextPacket({
+            issue: {
+              id: issueRef.id,
+              companyId: agent.companyId,
+              parentId: null,
+              githubRepo: null,
+              githubPrNumber: null,
+            },
+            agent: { id: agent.id, name: agent.name, companyId: agent.companyId },
+            workspaceCwd: executionWorkspace.cwd,
+            db,
           });
-        },
-        authToken: authToken ?? undefined,
+          if (packet) {
+            logger.info(
+              { runId: run.id, path: packet.path, bytes: packet.bytesWritten },
+              "context-packet-written",
+            );
+          }
+        } catch (err) {
+          logger.warn(
+            { runId: run.id, err: String(err) },
+            "context-gathering failed; proceeding without packet",
+          );
+        }
+      }
+      // DEV-269 Phase 1B: wrap adapter.execute in an OTel trace. Root span is
+      // `paperclip.heartbeat.run`, attributes identify the run/agent/issue.
+      // Non-fatal: any failure inside the tracer MUST NOT break the adapter
+      // call, so everything is wrapped in try/catch with span exports happening
+      // async via BatchSpanProcessor (BatchSpanProcessor never blocks).
+      const tracer = getTracer();
+      const runSpanAttrs = redactAttrs({
+        "run.id": run.id,
+        "agent.id": agent.id,
+        "agent.name": agent.name,
+        "agent.adapter_type": agent.adapterType,
+        "company.id": agent.companyId,
+        ...(issueRef
+          ? {
+              "issue.id": issueRef.id,
+              "issue.identifier": issueRef.identifier ?? "",
+              "issue.title": issueRef.title ?? "",
+              "issue.task_type": (issueRef as { taskType?: string | null }).taskType ?? "",
+            }
+          : {}),
       });
+      const adapterResult = await tracer.startActiveSpan(
+        "paperclip.heartbeat.run",
+        { attributes: runSpanAttrs },
+        async (span) => {
+          try {
+            const result = await adapter.execute({
+              runId: run.id,
+              agent,
+              runtime: runtimeForAdapter,
+              config: runtimeConfig,
+              context,
+              executionTarget,
+              executionTransport: remoteExecution
+                ? { remoteExecution: remoteExecution as unknown as Record<string, unknown> }
+                : undefined,
+              onLog,
+              onMeta: onAdapterMeta,
+              onSpawn: async (meta) => {
+                await persistRunProcessMetadata(run.id, {
+                  pid: meta.pid,
+                  processGroupId:
+                    "processGroupId" in meta && typeof meta.processGroupId === "number"
+                      ? meta.processGroupId
+                      : null,
+                  startedAt: meta.startedAt,
+                });
+              },
+              authToken: authToken ?? undefined,
+            });
+            // Record outcome attributes post-execute. Usage/cost goes on the
+            // root span as attributes rather than a child generation span —
+            // simpler for Phase 1; can split later if Langfuse UI wants it.
+            try {
+              const usage = (result as { usage?: UsageSummary | null }).usage;
+              if (usage) {
+                span.setAttributes(
+                  redactAttrs({
+                    "llm.tokens.input": usage.inputTokens ?? 0,
+                    "llm.tokens.output": usage.outputTokens ?? 0,
+                    "llm.tokens.cached_input": usage.cachedInputTokens ?? 0,
+                  }),
+                );
+              }
+              const status = (result as { status?: string }).status;
+              if (typeof status === "string") {
+                span.setAttribute("run.status", status);
+              }
+            } catch (err) {
+              // Attribute-setting failure is not fatal; just log it.
+              logger.warn(
+                { runId: run.id, err: String(err) },
+                "telemetry: failed to attach result attributes to run span",
+              );
+            }
+            return result;
+          } catch (err) {
+            try {
+              span.recordException(err as Error);
+              span.setStatus({ code: 2 /* SpanStatusCode.ERROR */ });
+            } catch {
+              /* never let telemetry throw */
+            }
+            throw err;
+          } finally {
+            try {
+              span.end();
+            } catch {
+              /* never let telemetry throw */
+            }
+          }
+        },
+      );
       const adapterManagedRuntimeServices = adapterResult.runtimeServices
         ? await persistAdapterManagedRuntimeServices({
             db,

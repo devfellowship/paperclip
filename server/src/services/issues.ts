@@ -1281,6 +1281,10 @@ const issueListSelect = {
   hiddenAt: issues.hiddenAt,
   createdAt: issues.createdAt,
   updatedAt: issues.updatedAt,
+  // DFL fork additions (harness-v2 task taxonomy):
+  taskType: issues.taskType,
+  taskBody: issues.taskBody,
+  completionReport: issues.completionReport,
   githubRepo: issues.githubRepo,
   githubPrNumber: issues.githubPrNumber,
 };

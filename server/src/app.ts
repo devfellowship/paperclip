@@ -41,6 +41,9 @@ import { accessRoutes } from "./routes/access.js";
 import { pluginRoutes } from "./routes/plugins.js";
 import { adapterRoutes } from "./routes/adapters.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
+import { webhooksGithubRoutes } from "./routes/webhooks-github.js";
+import { blockerRoutes } from "./routes/blockers.js";
+import type { heartbeatService } from "./services/heartbeat.js";
 import { applyUiBranding } from "./ui-branding.js";
 import { logger } from "./middleware/logger.js";
 import { DEFAULT_LOCAL_PLUGIN_DIR, pluginLoader } from "./services/plugin-loader.js";
@@ -133,6 +136,7 @@ export async function createApp(
     pluginWorkerManager?: PluginWorkerManager;
     betterAuthHandler?: express.RequestHandler;
     resolveSession?: (req: ExpressRequest) => Promise<BetterAuthSessionResult | null>;
+    heartbeat?: ReturnType<typeof heartbeatService>;
   },
 ) {
   const app = express();
@@ -211,6 +215,7 @@ export async function createApp(
   api.use(sidebarPreferenceRoutes(db));
   api.use(inboxDismissalRoutes(db));
   api.use(instanceSettingsRoutes(db));
+  api.use(blockerRoutes(db));
   if (opts.databaseBackupService) {
     api.use(instanceDatabaseBackupRoutes(opts.databaseBackupService));
   }
@@ -290,6 +295,9 @@ export async function createApp(
       allowedHostnames: opts.allowedHostnames,
     }),
   );
+  if (opts.heartbeat) {
+    app.use("/api", webhooksGithubRoutes(db, opts.heartbeat));
+  }
   app.use("/api", api);
   app.use("/api", (_req, res) => {
     res.status(404).json({ error: "API route not found" });
