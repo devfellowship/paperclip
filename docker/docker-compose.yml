@@ -1,6 +1,6 @@
 services:
   db:
-    image: postgres:17-alpine
+    image: pgvector/pgvector:pg17
     environment:
       POSTGRES_USER: paperclip
       POSTGRES_PASSWORD: paperclip

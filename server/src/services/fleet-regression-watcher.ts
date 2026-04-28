@@ -1,5 +1,5 @@
 /**
- * Fleet regression watcher (DEV-245, WS-1.a)
+ * Fleet regression watcher (DEV-245, WS-1.a, DEV-502)
  *
  * Polls https://fleet-health.devfellowship.com/api/failing-prs every ~15 min
  * and reconciles the result against Paperclip issues for a target company:
@@ -9,8 +9,12 @@
  *     `githubRepo` + `githubPrNumber` set so the existing PR-CI webhook and
  *     agent routing pick it up.
  *   - For every open issue whose PR is no longer in the failing list AND is
- *     confirmed green via /api/fleet, post a "CI now passing" comment. We
- *     deliberately do NOT auto-close — leave that to the agent or human.
+ *     confirmed green via /api/fleet, post a "CI now passing" comment.
+ *   - Auto-close stale issues (DEV-502):
+ *       • PR issues: cancelled when the PR disappears from openPRBranches
+ *         (merged or closed).
+ *       • Main-branch issues: cancelled after ≥3 consecutive green
+ *         observations tracked via streak-marker comments.
  *
  * Idempotency: a dedup hash of `(repo, pr, checks)` is embedded in the issue
  * description as an HTML comment marker. Before creating a new issue we look
@@ -23,7 +27,7 @@
  * Pure backend — no LLM, no agent code.
  */
 import { createHash } from "node:crypto";
-import { and, eq, inArray, isNotNull, like } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, isNull, like } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { issueComments, issues } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
@@ -52,6 +56,10 @@ export interface FailingPR {
 export interface FleetSnapshotRepo {
   fullName?: string;
   name?: string;
+  ciStatus?: string;
+  ciWorkflowName?: string | null;
+  lastCiRun?: string | null;
+  defaultBranch?: string;
   openPRBranches?: Array<{
     prNumber?: number;
     conclusion?: string | null;
@@ -65,10 +73,22 @@ export interface FleetSnapshot {
   repos?: FleetSnapshotRepo[];
 }
 
+export interface FailingMainBranch {
+  repo: string;
+  ciWorkflowName?: string | null;
+  lastCiRun?: string | null;
+  defaultBranch?: string;
+}
+
 export interface ReconcileSummary {
   opened: number;
   resolved: number;
   skipped: number;
+  autoClosed: number;
+  mainBranchOpened: number;
+  mainBranchResolved: number;
+  mainBranchSkipped: number;
+  mainBranchAutoClosed: number;
   digest: string;
 }
 
@@ -80,7 +100,7 @@ export interface FleetWatcherDeps {
   fetchFailingPRs: () => Promise<FailingPR[]>;
   fetchFleetSnapshot: () => Promise<FleetSnapshot | null>;
   /** Subset of issueService shape we need. */
-  issues: Pick<ReturnType<typeof issueService>, "create" | "addComment">;
+  issues: Pick<ReturnType<typeof issueService>, "create" | "addComment" | "update">;
   db: Db;
   companyId: string;
   /** Optional: notify via Telegram or other channel when digest ready. */
@@ -107,6 +127,50 @@ const OPEN_ISSUE_STATUSES = [
   "in_review",
   "blocked",
 ] as const;
+
+export const GREEN_STREAK_MARKER = "<!-- fleet-watcher-green-streak -->";
+export const AUTO_CLOSED_MARKER = "<!-- fleet-watcher-auto-closed -->";
+export const GREEN_STREAK_THRESHOLD = 3;
+
+// ---------------------------------------------------------------------------
+// Assignee routing
+// ---------------------------------------------------------------------------
+
+const INFRA_REPOS = new Set([
+  "dfl-ci",
+  "dfl-harness",
+  "dfl-infra",
+  "dfl-fleet-health",
+  "dfl-sandbox-manager",
+]);
+
+const DEFAULT_ASSIGNEE_MAP: Record<string, string> = {
+  infra: "52b8e0f6-a267-40ed-9664-d8917f4495b5",   // dfl-rollout-ops
+  app:   "bb604576-2eb5-4fd3-9088-a48e469e6432",     // dfl-single-repo-impl
+};
+
+function loadAssigneeMap(): Record<string, string> {
+  const raw = process.env.FLEET_WATCHER_ASSIGNEE_MAP_JSON;
+  if (!raw) return DEFAULT_ASSIGNEE_MAP;
+  try {
+    return JSON.parse(raw) as Record<string, string>;
+  } catch {
+    logger.warn("fleet-watcher: invalid FLEET_WATCHER_ASSIGNEE_MAP_JSON, using defaults");
+    return DEFAULT_ASSIGNEE_MAP;
+  }
+}
+
+export function resolveAssignee(repoFullName: string): string | undefined {
+  const map = loadAssigneeMap();
+  const shortName = repoFullName.includes("/")
+    ? repoFullName.split("/").pop()!
+    : repoFullName;
+
+  if (!shortName.startsWith("dfl-")) return undefined;
+
+  if (INFRA_REPOS.has(shortName)) return map.infra;
+  return map.app;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -169,15 +233,97 @@ export function buildIssueDescription(pr: FailingPR, dedupHash: string): string 
   ].join("\n");
 }
 
+export function computeMainBranchDedupHash(repo: string): string {
+  const payload = `${repo}|main`;
+  return createHash("sha256").update(payload).digest("hex").slice(0, 16);
+}
+
+export function buildMainBranchIssueTitle(repo: string): string {
+  return `Fix failing CI: ${repo} main branch`;
+}
+
+export function buildMainBranchIssueDescription(
+  mb: FailingMainBranch,
+  dedupHash: string,
+): string {
+  const workflow = mb.ciWorkflowName ?? "(unknown)";
+  const lastRun = mb.lastCiRun ?? "(unknown)";
+  const branch = mb.defaultBranch ?? "main";
+  const repoUrl = `https://github.com/${mb.repo}`;
+
+  return [
+    `Auto-opened by the fleet regression watcher (DEV-245, DEV-419).`,
+    ``,
+    `**Repo**: ${mb.repo}`,
+    `**Branch**: ${branch} (default)`,
+    `**CI Workflow**: ${workflow}`,
+    `**Last CI Run**: ${lastRun}`,
+    `**Actions**: ${repoUrl}/actions`,
+    ``,
+    `## Problem`,
+    `The default branch (\`${branch}\`) has failing CI. This means merges to main are broken and deployments may be affected.`,
+    ``,
+    `## Recovery procedure`,
+    `1. Check the latest CI run: ${repoUrl}/actions`,
+    `2. Identify the failing step and fix it on a new branch.`,
+    `3. Open a PR with the fix and verify CI passes.`,
+    `4. Merge the fix — when fleet-health flips the repo to green this issue will receive a comment.`,
+    ``,
+    `Source: ${FLEET_HEALTH_SNAPSHOT_URL}`,
+    ``,
+    buildDedupMarker(dedupHash),
+  ].join("\n");
+}
+
+export function extractFailingMainBranches(
+  snapshot: FleetSnapshot | null,
+): FailingMainBranch[] {
+  if (!snapshot?.repos) return [];
+  return snapshot.repos
+    .filter((r) => r.ciStatus === "failing" && (r.fullName || r.name))
+    .map((r) => ({
+      repo: r.fullName ?? r.name!,
+      ciWorkflowName: r.ciWorkflowName,
+      lastCiRun: r.lastCiRun,
+      defaultBranch: r.defaultBranch,
+    }));
+}
+
+export function isMainBranchGreenInSnapshot(
+  snapshot: FleetSnapshot | null,
+  repoFullName: string,
+): boolean {
+  if (!snapshot?.repos) return false;
+  for (const repo of snapshot.repos) {
+    const name = repo.fullName ?? repo.name ?? "";
+    if (name !== repoFullName) continue;
+    return repo.ciStatus === "passing";
+  }
+  return false;
+}
+
 export function buildDigest(
   failingPRs: FailingPR[],
   opened: number,
   now: Date,
+  failingMainBranches?: number,
+  mainBranchOpened?: number,
+  totalAutoClosed?: number,
 ): string {
   const red = failingPRs.length;
   const repos = new Set(failingPRs.map((p) => p.repo)).size;
   const iso = now.toISOString().slice(0, 10);
-  return `[fleet-watcher ${iso}] ${red} red PR${red === 1 ? "" : "s"}, ${repos} repo${repos === 1 ? "" : "s"} affected, ${opened} new ticket${opened === 1 ? "" : "s"} opened.`;
+  const mainCount = failingMainBranches ?? 0;
+  const mainOpened = mainBranchOpened ?? 0;
+  const totalOpened = opened + mainOpened;
+  const closed = totalAutoClosed ?? 0;
+  const mainPart = mainCount > 0
+    ? `, ${mainCount} red main branch${mainCount === 1 ? "" : "es"}`
+    : "";
+  const closedPart = closed > 0
+    ? `, ${closed} auto-closed`
+    : "";
+  return `[fleet-watcher ${iso}] ${red} red PR${red === 1 ? "" : "s"}, ${repos} repo${repos === 1 ? "" : "s"} affected${mainPart}, ${totalOpened} new ticket${totalOpened === 1 ? "" : "s"} opened${closedPart}.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -201,14 +347,30 @@ async function defaultFetchJson<T>(url: string): Promise<T | null> {
 }
 
 export async function fetchFailingPRs(): Promise<FailingPR[]> {
-  const data = await defaultFetchJson<FailingPR[]>(FLEET_HEALTH_FAILING_PRS_URL);
-  if (!Array.isArray(data)) return [];
-  return data.filter(
+  const data = await defaultFetchJson<FailingPR[] | { prs?: FailingPR[]; total?: number }>(
+    FLEET_HEALTH_FAILING_PRS_URL,
+  );
+  // Accept both bare array and { prs: [...] } envelope shapes
+  const rows: unknown[] = Array.isArray(data)
+    ? data
+    : (data as any)?.prs != null && Array.isArray((data as any).prs)
+      ? (data as any).prs
+      : [];
+  if (rows.length === 0 && data != null && typeof data === "object" && !Array.isArray(data)) {
+    const total = (data as any).total;
+    if (typeof total === "number" && total > 0) {
+      logger.warn(
+        { url: FLEET_HEALTH_FAILING_PRS_URL, envelopeTotal: total, extractedCount: 0 },
+        "fleet-watcher: envelope total > 0 but extracted 0 PRs — possible shape drift",
+      );
+    }
+  }
+  return rows.filter(
     (row): row is FailingPR =>
       row != null &&
       typeof row === "object" &&
-      typeof row.repo === "string" &&
-      typeof row.prNumber === "number",
+      typeof (row as any).repo === "string" &&
+      typeof (row as any).prNumber === "number",
   );
 }
 
@@ -243,6 +405,27 @@ export function isPRGreenInSnapshot(
 }
 
 // ---------------------------------------------------------------------------
+// Snapshot lookup: is the PR absent (merged/closed)?
+// ---------------------------------------------------------------------------
+
+export function isPRAbsentFromSnapshot(
+  snapshot: FleetSnapshot | null,
+  repoFullName: string,
+  prNumber: number,
+): boolean {
+  if (!snapshot?.repos) return false;
+  for (const repo of snapshot.repos) {
+    const name = repo.fullName ?? repo.name ?? "";
+    if (name !== repoFullName) continue;
+    for (const pr of repo.openPRBranches ?? []) {
+      if (pr.prNumber === prNumber) return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // Main reconcile
 // ---------------------------------------------------------------------------
 
@@ -251,6 +434,7 @@ export async function reconcileFailingPRs(
 ): Promise<ReconcileSummary> {
   const now = deps.now?.() ?? new Date();
   const failingPRs = await deps.fetchFailingPRs();
+  const snapshot = await deps.fetchFleetSnapshot();
 
   let opened = 0;
   let skipped = 0;
@@ -280,9 +464,6 @@ export async function reconcileFailingPRs(
 
       const dedupHash = computeDedupHash(pr);
       const marker = buildDedupMarker(dedupHash);
-      // Dedup fallback: description contains the same hash marker (handles
-      // races where githubRepo/githubPrNumber weren't populated for some
-      // reason, e.g. a human opened a ticket manually without those fields).
       const markerHit = await deps.db
         .select({ id: issues.id })
         .from(issues)
@@ -301,12 +482,14 @@ export async function reconcileFailingPRs(
 
       const title = buildIssueTitle(pr);
       const description = buildIssueDescription(pr, dedupHash);
+      const assigneeAgentId = resolveAssignee(pr.repo);
 
       await deps.issues.create(deps.companyId, {
         title,
         description,
         status: "todo",
-        priority: "medium",
+        priority: "high",
+        assigneeAgentId,
         githubRepo: pr.repo,
         githubPrNumber: pr.prNumber,
         originKind: "fleet_watcher",
@@ -315,6 +498,76 @@ export async function reconcileFailingPRs(
       opened++;
     } catch (err) {
       logger.error({ err, pr: `${pr.repo}#${pr.prNumber}` }, "fleet-watcher: failed to open issue");
+    }
+  }
+
+  // --------------------------------------------------------------
+  // Phase 1b: ensure every failing main branch has an open issue
+  // --------------------------------------------------------------
+  const failingMainBranches = extractFailingMainBranches(snapshot);
+  let mainBranchOpened = 0;
+  let mainBranchSkipped = 0;
+
+  for (const mb of failingMainBranches) {
+    try {
+      const originId = `${mb.repo}#main`;
+      const dedupHash = computeMainBranchDedupHash(mb.repo);
+      const marker = buildDedupMarker(dedupHash);
+
+      // Dedup: check by (githubRepo, NULL prNumber, originKind=fleet_watcher)
+      const existing = await deps.db
+        .select({ id: issues.id })
+        .from(issues)
+        .where(
+          and(
+            eq(issues.companyId, deps.companyId),
+            eq(issues.githubRepo, mb.repo),
+            isNull(issues.githubPrNumber),
+            inArray(issues.status, OPEN_ISSUE_STATUSES as unknown as string[]),
+          ),
+        )
+        .limit(1);
+
+      if (existing.length > 0) {
+        mainBranchSkipped++;
+        continue;
+      }
+
+      // Dedup fallback via marker
+      const markerHit = await deps.db
+        .select({ id: issues.id })
+        .from(issues)
+        .where(
+          and(
+            eq(issues.companyId, deps.companyId),
+            like(issues.description, `%${marker}%`),
+            inArray(issues.status, OPEN_ISSUE_STATUSES as unknown as string[]),
+          ),
+        )
+        .limit(1);
+      if (markerHit.length > 0) {
+        mainBranchSkipped++;
+        continue;
+      }
+
+      const title = buildMainBranchIssueTitle(mb.repo);
+      const description = buildMainBranchIssueDescription(mb, dedupHash);
+      const assigneeAgentId = resolveAssignee(mb.repo);
+
+      await deps.issues.create(deps.companyId, {
+        title,
+        description,
+        status: "todo",
+        priority: "high",
+        assigneeAgentId,
+        githubRepo: mb.repo,
+        githubPrNumber: null,
+        originKind: "fleet_watcher",
+        originId,
+      } as Parameters<typeof deps.issues.create>[1]);
+      mainBranchOpened++;
+    } catch (err) {
+      logger.error({ err, repo: mb.repo }, "fleet-watcher: failed to open main-branch issue");
     }
   }
 
@@ -346,41 +599,214 @@ export async function reconcileFailingPRs(
     return !failingKey.has(`${row.githubRepo}#${row.githubPrNumber}`);
   });
 
-  if (needsSnapshot.length > 0) {
-    const snapshot = await deps.fetchFleetSnapshot();
-    for (const row of needsSnapshot) {
-      if (!row.githubRepo || row.githubPrNumber == null) continue;
-      if (!isPRGreenInSnapshot(snapshot, row.githubRepo, row.githubPrNumber)) {
-        continue;
-      }
-      // Idempotency: don't post the same "CI now passing" comment repeatedly.
-      const already = await deps.db
-        .select({ id: issueComments.id })
-        .from(issueComments)
-        .where(
-          and(
-            eq(issueComments.issueId, row.id),
-            like(issueComments.body, "%CI now passing — see fleet-health.%"),
-          ),
-        )
-        .limit(1);
-      if (already.length > 0) continue;
+  for (const row of needsSnapshot) {
+    if (!row.githubRepo || row.githubPrNumber == null) continue;
+    if (!isPRGreenInSnapshot(snapshot, row.githubRepo, row.githubPrNumber)) {
+      continue;
+    }
+    const already = await deps.db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, row.id),
+          like(issueComments.body, "%CI now passing — see fleet-health.%"),
+        ),
+      )
+      .limit(1);
+    if (already.length > 0) continue;
 
+    try {
+      await deps.issues.addComment(
+        row.id,
+        `CI now passing — see fleet-health. (auto-posted by fleet regression watcher)`,
+        { agentId: undefined, userId: undefined, runId: null },
+      );
+      resolved++;
+    } catch (err) {
+      logger.warn({ err, issueId: row.id }, "fleet-watcher: failed to post CI-green comment");
+    }
+  }
+
+  // --------------------------------------------------------------
+  // Phase 2b: main-branch issues whose CI is now green →
+  // post a "CI now passing" comment (mirrors Phase 2 pattern).
+  // --------------------------------------------------------------
+  let mainBranchResolved = 0;
+  const failingMainRepoSet = new Set(failingMainBranches.map((m) => m.repo));
+  const justResolvedMainBranchIds = new Set<string>();
+
+  const openMainBranchIssues = await deps.db
+    .select({
+      id: issues.id,
+      githubRepo: issues.githubRepo,
+    })
+    .from(issues)
+    .where(
+      and(
+        eq(issues.companyId, deps.companyId),
+        isNotNull(issues.githubRepo),
+        isNull(issues.githubPrNumber),
+        eq(issues.originKind, "fleet_watcher"),
+        like(issues.originId, "%#main"),
+        inArray(issues.status, OPEN_ISSUE_STATUSES as unknown as string[]),
+      ),
+    );
+
+  for (const row of openMainBranchIssues) {
+    if (!row.githubRepo) continue;
+    if (failingMainRepoSet.has(row.githubRepo)) continue;
+    if (!isMainBranchGreenInSnapshot(snapshot, row.githubRepo)) continue;
+
+    const already = await deps.db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, row.id),
+          like(issueComments.body, "%CI now passing — see fleet-health.%"),
+        ),
+      )
+      .limit(1);
+    if (already.length > 0) continue;
+
+    try {
+      await deps.issues.addComment(
+        row.id,
+        `Main branch CI now passing — see fleet-health. (auto-posted by fleet regression watcher)`,
+        { agentId: undefined, userId: undefined, runId: null },
+      );
+      mainBranchResolved++;
+      justResolvedMainBranchIds.add(row.id);
+    } catch (err) {
+      logger.warn({ err, issueId: row.id }, "fleet-watcher: failed to post main-branch CI-green comment");
+    }
+  }
+
+  // --------------------------------------------------------------
+  // Phase 3: auto-cancel PR issues whose PR is no longer open
+  // (merged or closed). Detected by the PR being absent from
+  // openPRBranches in the fleet snapshot.
+  // --------------------------------------------------------------
+  let autoClosed = 0;
+
+  for (const row of needsSnapshot) {
+    if (!row.githubRepo || row.githubPrNumber == null) continue;
+    if (!isPRAbsentFromSnapshot(snapshot, row.githubRepo, row.githubPrNumber)) continue;
+
+    const alreadyClosed = await deps.db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, row.id),
+          like(issueComments.body, `%${AUTO_CLOSED_MARKER}%`),
+        ),
+      )
+      .limit(1);
+    if (alreadyClosed.length > 0) continue;
+
+    try {
+      await deps.issues.addComment(
+        row.id,
+        `Auto-closed: PR #${row.githubPrNumber} is no longer open (merged or closed). ${AUTO_CLOSED_MARKER}`,
+        { agentId: undefined, userId: undefined, runId: null },
+      );
+      await deps.issues.update(row.id, { status: "cancelled" });
+      autoClosed++;
+    } catch (err) {
+      logger.warn({ err, issueId: row.id }, "fleet-watcher: failed to auto-close PR issue");
+    }
+  }
+
+  // --------------------------------------------------------------
+  // Phase 3b: auto-cancel main-branch issues after ≥3 consecutive
+  // green observations. Each tick where main is green adds a
+  // streak marker; the "CI now passing" comment from Phase 2b
+  // counts as observation #1.
+  // --------------------------------------------------------------
+  let mainBranchAutoClosed = 0;
+
+  for (const row of openMainBranchIssues) {
+    if (!row.githubRepo) continue;
+    if (failingMainRepoSet.has(row.githubRepo)) continue;
+    if (!isMainBranchGreenInSnapshot(snapshot, row.githubRepo)) continue;
+    if (justResolvedMainBranchIds.has(row.id)) continue;
+
+    const hasGreenComment = await deps.db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, row.id),
+          like(issueComments.body, "%CI now passing — see fleet-health.%"),
+        ),
+      )
+      .limit(1);
+    if (hasGreenComment.length === 0) continue;
+
+    const alreadyClosed = await deps.db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, row.id),
+          like(issueComments.body, `%${AUTO_CLOSED_MARKER}%`),
+        ),
+      )
+      .limit(1);
+    if (alreadyClosed.length > 0) continue;
+
+    const streakMarkers = await deps.db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, row.id),
+          like(issueComments.body, `%${GREEN_STREAK_MARKER}%`),
+        ),
+      );
+    const streakCount = streakMarkers.length;
+
+    // Total green observations = 1 ("CI now passing") + streakCount + 1 (this tick)
+    const totalObservations = streakCount + 2;
+    if (totalObservations >= GREEN_STREAK_THRESHOLD) {
       try {
         await deps.issues.addComment(
           row.id,
-          `CI now passing — see fleet-health. (auto-posted by fleet regression watcher)`,
+          `Auto-closed: main branch CI green for ${totalObservations} consecutive observations. ${AUTO_CLOSED_MARKER}`,
           { agentId: undefined, userId: undefined, runId: null },
         );
-        resolved++;
+        await deps.issues.update(row.id, { status: "cancelled" });
+        mainBranchAutoClosed++;
       } catch (err) {
-        logger.warn({ err, issueId: row.id }, "fleet-watcher: failed to post CI-green comment");
+        logger.warn({ err, issueId: row.id }, "fleet-watcher: failed to auto-close main-branch issue");
+      }
+    } else {
+      try {
+        await deps.issues.addComment(
+          row.id,
+          `Main branch still green (${streakCount + 1}/${GREEN_STREAK_THRESHOLD}). ${GREEN_STREAK_MARKER}`,
+          { agentId: undefined, userId: undefined, runId: null },
+        );
+      } catch (err) {
+        logger.warn({ err, issueId: row.id }, "fleet-watcher: failed to post green-streak marker");
       }
     }
   }
 
-  const digest = buildDigest(failingPRs, opened, now);
-  return { opened, resolved, skipped, digest };
+  const digest = buildDigest(failingPRs, opened, now, failingMainBranches.length, mainBranchOpened, autoClosed + mainBranchAutoClosed);
+  return {
+    opened,
+    resolved,
+    skipped,
+    autoClosed,
+    mainBranchOpened,
+    mainBranchResolved,
+    mainBranchSkipped,
+    mainBranchAutoClosed,
+    digest,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -388,7 +814,7 @@ export async function reconcileFailingPRs(
 // ---------------------------------------------------------------------------
 
 export interface FleetWatcherSchedulerOptions {
-  /** How often to run reconcile. Defaults to 15 minutes. */
+  /** How often to run reconcile. Defaults to 30 minutes. */
   reconcileIntervalMs?: number;
   /** Hour in UTC for daily digest (default: 12 = 9am BRT, UTC-3). */
   digestHourUtc?: number;
@@ -426,9 +852,20 @@ export function createFleetWatcherTick(
     try {
       const now = deps.now?.() ?? new Date();
       const result = await reconcileFailingPRs(deps);
-      if (result.opened > 0 || result.resolved > 0) {
+      const hadActivity = result.opened > 0 || result.resolved > 0 ||
+        result.mainBranchOpened > 0 || result.mainBranchResolved > 0 ||
+        result.autoClosed > 0 || result.mainBranchAutoClosed > 0;
+      if (hadActivity) {
         logger.info(
-          { opened: result.opened, resolved: result.resolved, skipped: result.skipped },
+          {
+            opened: result.opened,
+            resolved: result.resolved,
+            skipped: result.skipped,
+            autoClosed: result.autoClosed,
+            mainBranchOpened: result.mainBranchOpened,
+            mainBranchResolved: result.mainBranchResolved,
+            mainBranchAutoClosed: result.mainBranchAutoClosed,
+          },
           "fleet-watcher: reconcile complete",
         );
       }
