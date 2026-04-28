@@ -519,6 +519,13 @@
       "when": 1777522407000,
       "tag": "0073_pgvector_decision_records",
       "breakpoints": true
+    },
+    {
+      "idx": 74,
+      "version": "7",
+      "when": 1777336011229,
+      "tag": "0074_fleet_watcher_github_pr_columns",
+      "breakpoints": true
     }
   ]
 }
