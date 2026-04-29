@@ -5,9 +5,8 @@
  * Drift signal: >5 manual-closed per week suggests the resolver is missing cases.
  */
 import { Router } from "express";
-import { sql, and, eq } from "drizzle-orm";
+import { sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { issues, issueComments } from "@paperclipai/db";
 import { assertCompanyAccess } from "./authz.js";
 import { AUTO_CLOSED_MARKER } from "../services/fleet-regression-watcher.js";
 
@@ -49,13 +48,13 @@ export function fleetWatcherDashboardRoutes(db: Db) {
       ORDER BY week_start DESC
     `);
 
-    const weeks = rows.rows ?? rows;
-    const driftWeeks = (weeks as any[]).filter((w: any) => w.manual_closed > 5);
+    const weeks = Array.from(rows);
+    const driftWeeks = weeks.filter((w) => w.manual_closed > 5);
 
     res.json({
       weeks,
       driftSignal: driftWeeks.length > 0,
-      driftWeeks: driftWeeks.map((w: any) => w.week),
+      driftWeeks: driftWeeks.map((w) => w.week),
     });
   });
 
