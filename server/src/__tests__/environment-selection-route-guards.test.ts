@@ -79,9 +79,9 @@ vi.mock("../services/index.js", () => ({
   routineService: () => ({}),
   workProductService: () => ({}),
   blockerService: () => ({
-    create: vi.fn(),
-    listByIssue: vi.fn(async () => []),
-    update: vi.fn(),
+    create: vi.fn(async () => ({ ok: true, posted: false })),
+    resolve: vi.fn(async () => undefined),
+    resolveByTaskId: vi.fn(async () => undefined),
   }),
 }));
 

@@ -102,7 +102,7 @@ function registerModuleMocks() {
     projectService: () => ({}),
     routineService: () => ({ syncRunStatusForIssue: vi.fn(async () => undefined) }),
     workProductService: () => ({}),
-    blockerService: () => ({ create: vi.fn(), listByIssue: vi.fn(async () => []), update: vi.fn() }),
+    blockerService: () => ({ create: vi.fn(async () => ({ ok: true, posted: false })), resolve: vi.fn(async () => undefined), resolveByTaskId: vi.fn(async () => undefined) }),
   }));
 }
 
