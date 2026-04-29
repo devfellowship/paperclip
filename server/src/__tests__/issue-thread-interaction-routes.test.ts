@@ -90,6 +90,7 @@ function registerModuleMocks() {
       syncRunStatusForIssue: vi.fn(async () => undefined),
     }),
     workProductService: () => ({}),
+    blockerService: () => ({ create: vi.fn(), listByIssue: vi.fn(async () => []), update: vi.fn() }),
   }));
 }
 

@@ -137,6 +137,7 @@ vi.mock("../services/index.js", () => ({
   projectService: () => ({}),
   routineService: () => mockRoutineService,
   workProductService: () => ({}),
+  blockerService: () => ({ create: vi.fn(), listByIssue: vi.fn(async () => []), update: vi.fn() }),
 }));
 
 function createApp() {

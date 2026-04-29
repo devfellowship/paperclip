@@ -96,6 +96,7 @@ function registerModuleMocks() {
     projectService: () => ({}),
     routineService: () => mockRoutineService,
     workProductService: () => ({}),
+    blockerService: () => ({ create: vi.fn(), listByIssue: vi.fn(async () => []), update: vi.fn() }),
   }));
 
   vi.doMock("../services/environments.js", () => ({
