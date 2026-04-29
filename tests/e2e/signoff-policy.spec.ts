@@ -25,6 +25,31 @@ const PORT = Number(process.env.PAPERCLIP_E2E_PORT ?? 3199);
 const BASE_URL = `http://127.0.0.1:${PORT}`;
 const COMPANY_NAME = `E2E-Signoff-${Date.now()}`;
 
+/**
+ * DEV-164 harness-v2 deterministic guards intercept agent
+ * in_progress→in_review and in_review→done transitions and require:
+ *   - validation evidence (non-empty, non-placeholder comment)
+ *   - output schema (≥50 chars + ≥2 non-empty lines)
+ *   - PR URL (only for in_progress→in_review)
+ *
+ * These helpers emit comments that satisfy all guards so the signoff
+ * policy under test can run end-to-end.
+ */
+const GUARD_PR_URL = "https://github.com/devfellowship/paperclip/pull/44";
+function execComment(label: string): string {
+  return [
+    `Executor report: ${label}.`,
+    `Validation: ran the full unit + integration suite locally; all green.`,
+    `PR: ${GUARD_PR_URL}`,
+  ].join("\n");
+}
+function reviewComment(label: string): string {
+  return [
+    `Reviewer signoff: ${label}.`,
+    `Verified the executor's evidence and the linked artifacts; ready to advance.`,
+  ].join("\n");
+}
+
 interface AgentAuth {
   agentId: string;
   token: string;
@@ -279,7 +304,7 @@ test.describe("Signoff execution policy", () => {
     // Step 1: Executor marks done → should route to reviewer
     const step1Res = await agentCheckoutAndPatch(
       ctx.boardRequest, ctx.executor, issueId, ["in_progress"],
-      { status: "done", comment: "Implemented the feature, ready for review." },
+      { status: "done", comment: execComment("happy path implementation") },
     );
     expect(step1Res.ok()).toBe(true);
     const step1Issue = await step1Res.json();
@@ -301,7 +326,7 @@ test.describe("Signoff execution policy", () => {
     // Step 3: Reviewer approves → should route to approver
     const step3Res = await agentPatch(
       ctx.boardRequest, ctx.reviewer, issueId,
-      { status: "done", comment: "QA signoff complete. Looks good." },
+      { status: "done", comment: reviewComment("QA signoff complete") },
     );
     expect(step3Res.ok()).toBe(true);
     const step3Issue = await step3Res.json();
@@ -319,7 +344,7 @@ test.describe("Signoff execution policy", () => {
     // Step 5: Approver approves → should complete
     const step5Res = await agentPatch(
       ctx.boardRequest, ctx.approver, issueId,
-      { status: "done", comment: "Approved. Ship it." },
+      { status: "done", comment: reviewComment("Approved. Ship it") },
     );
     expect(step5Res.ok()).toBe(true);
     const step5Issue = await step5Res.json();
@@ -337,12 +362,13 @@ test.describe("Signoff execution policy", () => {
     // Executor marks done → routes to reviewer
     const doneRes = await agentCheckoutAndPatch(
       ctx.boardRequest, ctx.executor, issueId, ["in_progress"],
-      { status: "done", comment: "Ready for review." },
+      { status: "done", comment: execComment("ready for review") },
     );
     expect(doneRes.ok()).toBe(true);
     expect((await doneRes.json()).status).toBe("in_review");
 
     // Reviewer requests changes → returns to executor
+    // (in_review→in_progress is NOT a guarded transition, so a short comment is fine)
     const changesRes = await agentPatch(
       ctx.boardRequest, ctx.reviewer, issueId,
       { status: "in_progress", comment: "Needs another pass on edge cases." },
@@ -358,7 +384,7 @@ test.describe("Signoff execution policy", () => {
     // Executor re-submits → goes back to reviewer (same stage)
     const resubmitRes = await agentCheckoutAndPatch(
       ctx.boardRequest, ctx.executor, issueId, ["in_progress"],
-      { status: "done", comment: "Fixed the edge cases." },
+      { status: "done", comment: execComment("fixed the edge cases") },
     );
     expect(resubmitRes.ok()).toBe(true);
     const resubmitIssue = await resubmitRes.json();
@@ -376,7 +402,7 @@ test.describe("Signoff execution policy", () => {
     // Executor marks done → routes to reviewer
     await agentCheckoutAndPatch(
       ctx.boardRequest, ctx.executor, issueId, ["in_progress"],
-      { status: "done", comment: "Done." },
+      { status: "done", comment: execComment("setup for comment-required test") },
     );
 
     // Reviewer tries to approve without comment → should fail
@@ -396,7 +422,7 @@ test.describe("Signoff execution policy", () => {
     // Executor marks done → routes to reviewer
     const doneRes = await agentCheckoutAndPatch(
       ctx.boardRequest, ctx.executor, issueId, ["in_progress"],
-      { status: "done", comment: "Done." },
+      { status: "done", comment: execComment("setup for non-participant test") },
     );
     expect(doneRes.ok()).toBe(true);
 
@@ -410,7 +436,7 @@ test.describe("Signoff execution policy", () => {
     // Non-participant (approver at this stage) tries to advance → should be rejected
     const advanceRes = await agentPatch(
       ctx.boardRequest, ctx.approver, issueId,
-      { status: "done", comment: "I'm the approver, not the reviewer." },
+      { status: "done", comment: reviewComment("approver attempting to bypass reviewer stage") },
     );
     expect(advanceRes.ok()).toBe(false);
     expect(advanceRes.status()).toBeGreaterThanOrEqual(400);
@@ -424,7 +450,7 @@ test.describe("Signoff execution policy", () => {
     // Executor marks done → routes to reviewer
     const doneRes = await agentCheckoutAndPatch(
       ctx.boardRequest, ctx.executor, issue.id, ["in_progress"],
-      { status: "done", comment: "Ready for review." },
+      { status: "done", comment: execComment("review-only flow") },
     );
     expect(doneRes.ok()).toBe(true);
     expect((await doneRes.json()).status).toBe("in_review");
@@ -432,7 +458,7 @@ test.describe("Signoff execution policy", () => {
     // Reviewer approves → should complete immediately (no approval stage)
     const approveRes = await agentPatch(
       ctx.boardRequest, ctx.reviewer, issue.id,
-      { status: "done", comment: "LGTM." },
+      { status: "done", comment: reviewComment("LGTM, review-only complete") },
     );
     expect(approveRes.ok()).toBe(true);
     const doneIssue = await approveRes.json();

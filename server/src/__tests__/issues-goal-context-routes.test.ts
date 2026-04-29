@@ -107,6 +107,7 @@ vi.mock("../services/index.js", () => ({
   projectService: () => mockProjectService,
   routineService: () => mockRoutineService,
   workProductService: () => mockWorkProductService,
+  blockerService: () => ({ create: vi.fn(async () => ({ ok: true, posted: false })), resolve: vi.fn(async () => undefined), resolveByTaskId: vi.fn(async () => undefined) }),
 }));
 
 vi.mock("../services/execution-workspaces.js", () => ({

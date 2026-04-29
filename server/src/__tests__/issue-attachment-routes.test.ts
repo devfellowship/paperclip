@@ -84,6 +84,7 @@ function registerRouteMocks() {
       syncRunStatusForIssue: vi.fn(async () => undefined),
     }),
     workProductService: () => ({}),
+    blockerService: () => ({ create: vi.fn(async () => ({ ok: true, posted: false })), resolve: vi.fn(async () => undefined), resolveByTaskId: vi.fn(async () => undefined) }),
   }));
 }
 

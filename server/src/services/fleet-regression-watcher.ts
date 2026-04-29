@@ -32,6 +32,7 @@ import type { Db } from "@paperclipai/db";
 import { issueComments, issues } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { issueService } from "./issues.js";
+import { recordAutoClose } from "./fleet-watcher-telemetry.js";
 
 // ---------------------------------------------------------------------------
 // Types (mirror fleet-health API contract)
@@ -713,6 +714,13 @@ export async function reconcileFailingPRs(
         { agentId: undefined, userId: undefined, runId: null },
       );
       await deps.issues.update(row.id, { status: "cancelled" });
+      recordAutoClose({
+        issueId: row.id,
+        githubRepo: row.githubRepo,
+        githubPrNumber: row.githubPrNumber,
+        reason: "pr-absent",
+        evidence: `PR #${row.githubPrNumber} absent from openPRBranches in fleet snapshot`,
+      });
       autoClosed++;
     } catch (err) {
       logger.warn({ err, issueId: row.id }, "fleet-watcher: failed to auto-close PR issue");
@@ -778,6 +786,13 @@ export async function reconcileFailingPRs(
           { agentId: undefined, userId: undefined, runId: null },
         );
         await deps.issues.update(row.id, { status: "cancelled" });
+        recordAutoClose({
+          issueId: row.id,
+          githubRepo: row.githubRepo!,
+          githubPrNumber: null,
+          reason: "main-green-streak",
+          evidence: `Main branch green for ${totalObservations} consecutive observations (threshold: ${GREEN_STREAK_THRESHOLD})`,
+        });
         mainBranchAutoClosed++;
       } catch (err) {
         logger.warn({ err, issueId: row.id }, "fleet-watcher: failed to auto-close main-branch issue");
