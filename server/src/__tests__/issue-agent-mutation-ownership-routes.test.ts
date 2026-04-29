@@ -85,7 +85,6 @@ function registerRouteMocks() {
 
   vi.doMock("../services/work-products.js", () => ({
     workProductService: () => mockWorkProductService,
-    blockerService: () => ({ create: vi.fn(), listByIssue: vi.fn(async () => []), update: vi.fn() }),
   }));
 
   vi.doMock("../services/activity-log.js", () => ({
@@ -141,6 +140,7 @@ function registerRouteMocks() {
       syncRunStatusForIssue: vi.fn(async () => undefined),
     }),
     workProductService: () => mockWorkProductService,
+    blockerService: () => ({ create: vi.fn(), listByIssue: vi.fn(async () => []), update: vi.fn() }),
   }));
 }
 
