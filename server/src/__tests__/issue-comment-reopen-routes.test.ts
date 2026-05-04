@@ -626,6 +626,71 @@ describe.sequential("issue comment reopen routes", () => {
     ));
   });
 
+  it("PAPERCLIP_KEEP_BLOCKED_ON_COMMENT=true keeps blocked issues blocked on POST comments", async () => {
+    const previous = process.env.PAPERCLIP_KEEP_BLOCKED_ON_COMMENT;
+    process.env.PAPERCLIP_KEEP_BLOCKED_ON_COMMENT = "true";
+    try {
+      mockIssueService.getById.mockResolvedValue(makeIssue("blocked"));
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...makeIssue("blocked"),
+        ...patch,
+      }));
+
+      const res = await request(await installActor(createApp()))
+        .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+        .send({ body: "still blocked because X" });
+
+      expect(res.status).toBe(201);
+      expect(mockIssueService.update).not.toHaveBeenCalledWith(
+        "11111111-1111-4111-8111-111111111111",
+        expect.objectContaining({ status: "todo" }),
+      );
+      await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        "22222222-2222-4222-8222-222222222222",
+        expect.objectContaining({
+          reason: "issue_commented",
+          contextSnapshot: expect.objectContaining({
+            wakeReason: "issue_commented",
+          }),
+        }),
+      ));
+    } finally {
+      if (previous === undefined) delete process.env.PAPERCLIP_KEEP_BLOCKED_ON_COMMENT;
+      else process.env.PAPERCLIP_KEEP_BLOCKED_ON_COMMENT = previous;
+    }
+  });
+
+  it("PAPERCLIP_KEEP_BLOCKED_ON_COMMENT=true keeps blocked issues blocked on PATCH comments", async () => {
+    const previous = process.env.PAPERCLIP_KEEP_BLOCKED_ON_COMMENT;
+    process.env.PAPERCLIP_KEEP_BLOCKED_ON_COMMENT = "true";
+    try {
+      mockIssueService.getById.mockResolvedValue(makeIssue("blocked"));
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...makeIssue("blocked"),
+        ...patch,
+      }));
+
+      const res = await request(await installActor(createApp()))
+        .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+        .send({ comment: "still blocked because X" });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).not.toHaveBeenCalledWith(
+        "11111111-1111-4111-8111-111111111111",
+        expect.objectContaining({ status: "todo" }),
+      );
+      await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        "22222222-2222-4222-8222-222222222222",
+        expect.objectContaining({
+          reason: "issue_commented",
+        }),
+      ));
+    } finally {
+      if (previous === undefined) delete process.env.PAPERCLIP_KEEP_BLOCKED_ON_COMMENT;
+      else process.env.PAPERCLIP_KEEP_BLOCKED_ON_COMMENT = previous;
+    }
+  });
+
   it("does not implicitly reopen closed issues via the PATCH comment path for agent-authored comments", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue("done"));
     mockIssueService.addComment.mockResolvedValue({
