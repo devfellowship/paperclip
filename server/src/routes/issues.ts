@@ -197,7 +197,17 @@ function shouldImplicitlyMoveCommentedIssueToTodo(input: {
   // Only human comments should implicitly reopen finished work.
   // Agent-authored comments remain communicative unless reopen was explicit.
   if (input.actorType !== "user") return false;
+  // Closed (done/cancelled) issues implicitly reopen on a human comment — that's
+  // the original "user follows up on a finished task" UX. Blocked issues are
+  // gated by PAPERCLIP_KEEP_BLOCKED_ON_COMMENT: when set to `true`, a triage
+  // comment on a blocked issue leaves it blocked (the whole point of `blocked`
+  // is "leave it parked, with a note explaining why"). When unset/false the
+  // legacy behavior — implicit reopen-on-comment — is preserved.
   if (!isClosedIssueStatus(input.issueStatus) && input.issueStatus !== "blocked") return false;
+  if (
+    input.issueStatus === "blocked"
+    && process.env.PAPERCLIP_KEEP_BLOCKED_ON_COMMENT === "true"
+  ) return false;
   if (typeof input.assigneeAgentId !== "string" || input.assigneeAgentId.length === 0) return false;
   return true;
 }
