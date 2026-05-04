@@ -5452,7 +5452,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           );
         }
       }
+      let capturedPrompt: string | undefined;
       const onAdapterMeta = async (meta: AdapterInvocationMeta) => {
+        if (meta.prompt) {
+          capturedPrompt = meta.prompt;
+        }
         if (meta.env && secretKeys.size > 0) {
           for (const key of secretKeys) {
             if (key in meta.env) meta.env[key] = "***REDACTED***";
@@ -5580,6 +5584,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               if (typeof status === "string") {
                 span.setAttribute("run.status", status);
               }
+              const model = (result as { model?: string | null }).model;
+              const costUsd = (result as { costUsd?: number | null }).costUsd;
+              const summary = (result as { summary?: string | null }).summary;
+              const resultJson = (result as { resultJson?: Record<string, unknown> | null }).resultJson;
+              const output = summary ?? (resultJson ? JSON.stringify(resultJson) : undefined);
+              span.setAttributes(
+                redactAttrs({
+                  ...(typeof model === "string" ? { "llm.model": model } : {}),
+                  ...(typeof costUsd === "number" ? { "llm.cost.usd": costUsd } : {}),
+                  ...(capturedPrompt ? { input: capturedPrompt } : {}),
+                  ...(typeof output === "string" ? { output } : {}),
+                }),
+              );
             } catch (err) {
               // Attribute-setting failure is not fatal; just log it.
               logger.warn(
