@@ -91,6 +91,7 @@ import { executionWorkspaceService, mergeExecutionWorkspaceConfig } from "./exec
 import { workspaceOperationService } from "./workspace-operations.js";
 import { gatherContextPacket } from "./context-gathering.js";
 import { getTracer, redactAttrs } from "../otel.js";
+import { context as otelContext, type Span, SpanStatusCode } from "@opentelemetry/api";
 import { isProcessGroupAlive, terminateLocalService } from "./local-service-supervisor.js";
 import {
   buildExecutionWorkspaceAdapterConfig,
@@ -171,6 +172,200 @@ export const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS = [
 ] as const;
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_JITTER_RATIO = 0.25;
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON = "transient_failure";
+const TOOL_ORPHAN_TIMEOUT_MS = 60_000;
+
+// OPE-7: per-tool-call OTel span emission.
+// Parses `claude` CLI stream-json chunks on the fly and opens/closes a
+// child span per `tool_use` / `tool_result` pair. Additive + non-fatal: any
+// parsing failure is swallowed so telemetry never breaks heartbeat.
+interface ToolUseBuffered {
+  id: string;
+  name: string;
+  input: unknown;
+  span: Span;
+  startedAt: number;
+}
+
+export class ToolSpanTracker {
+  private readonly buffer = { stdout: "", stderr: "" };
+  private readonly open: Map<string, ToolUseBuffered> = new Map();
+  private readonly timers: Map<string, ReturnType<typeof setTimeout>> = new Map();
+  private readonly order: string[] = [];
+  private readonly tracer = getTracer();
+  private readonly ctx = otelContext.active();
+
+  constructor(
+    private readonly runAttrs: Record<string, string>,
+    private readonly enabled: boolean,
+  ) {}
+
+  processChunk(stream: "stdout" | "stderr", chunk: string): void {
+    if (!this.enabled) return;
+    if (stream !== "stdout") return; // stream-json only on stdout
+    try {
+      this.buffer.stdout += chunk;
+      let newlineIdx = this.buffer.stdout.indexOf("\n");
+      while (newlineIdx !== -1) {
+        const line = this.buffer.stdout.slice(0, newlineIdx).trim();
+        this.buffer.stdout = this.buffer.stdout.slice(newlineIdx + 1);
+        if (line) this.consumeLine(line);
+        newlineIdx = this.buffer.stdout.indexOf("\n");
+      }
+    } catch {
+      // never throw from telemetry
+    }
+  }
+
+  /** Close any unpaired spans at run end. */
+  finalize(): void {
+    if (!this.enabled) return;
+    try {
+      for (const [id, timer] of this.timers) {
+        clearTimeout(timer);
+        this.timers.delete(id);
+      }
+      for (const entry of this.open.values()) {
+        try {
+          entry.span.setStatus({
+            code: SpanStatusCode.ERROR,
+            message: "tool_result_missing",
+          });
+          entry.span.setAttribute("tool.paired", false);
+          entry.span.setAttribute("tool.status", "orphan");
+          entry.span.end();
+        } catch {
+          /* swallow */
+        }
+      }
+      this.open.clear();
+    } catch {
+      /* swallow */
+    }
+  }
+
+  private consumeLine(line: string): void {
+    let chunk: unknown;
+    try {
+      chunk = JSON.parse(line);
+    } catch {
+      return; // partial/non-JSON — fine, skip
+    }
+    if (!chunk || typeof chunk !== "object") return;
+    const c = chunk as Record<string, unknown>;
+    const type = c.type;
+    const message = (c.message as Record<string, unknown> | undefined) ?? undefined;
+    const content = (message?.content as Array<Record<string, unknown>> | undefined) ?? [];
+    if (!Array.isArray(content)) return;
+    if (type === "assistant") {
+      for (const item of content) {
+        if (item?.type === "tool_use") this.openTool(item);
+      }
+    } else if (type === "user") {
+      for (const item of content) {
+        if (item?.type === "tool_result") this.closeTool(item);
+      }
+    }
+  }
+
+  private openTool(item: Record<string, unknown>): void {
+    const id = typeof item.id === "string" ? item.id : null;
+    const name = typeof item.name === "string" ? item.name : "unknown";
+    if (!id) return;
+    if (this.open.has(id)) return; // dedupe
+    try {
+      const inputStr = safeStringify(item.input);
+      const span = this.tracer.startSpan(
+        `tool:${name}`,
+        {
+          attributes: redactAttrs({
+            ...this.runAttrs,
+            "tool.name": name,
+            "tool.use_id": id,
+            "tool.input": inputStr,
+            "langfuse.span.input": inputStr,
+          }),
+        },
+        this.ctx,
+      );
+      this.open.set(id, {
+        id,
+        name,
+        input: item.input,
+        span,
+        startedAt: Date.now(),
+      });
+      this.order.push(id);
+      const timer = setTimeout(() => {
+        this.timers.delete(id);
+        const orphan = this.open.get(id);
+        if (!orphan) return;
+        try {
+          orphan.span.setStatus({
+            code: SpanStatusCode.ERROR,
+            message: "tool_result_missing",
+          });
+          orphan.span.setAttribute("tool.paired", false);
+          orphan.span.setAttribute("tool.status", "orphan");
+          orphan.span.end();
+        } catch {
+          /* swallow */
+        } finally {
+          this.open.delete(id);
+        }
+      }, TOOL_ORPHAN_TIMEOUT_MS);
+      this.timers.set(id, timer);
+    } catch {
+      /* swallow */
+    }
+  }
+
+  private closeTool(item: Record<string, unknown>): void {
+    const id =
+      typeof item.tool_use_id === "string" ? item.tool_use_id : null;
+    if (!id) return;
+    const timer = this.timers.get(id);
+    if (timer) {
+      clearTimeout(timer);
+      this.timers.delete(id);
+    }
+    const entry = this.open.get(id);
+    if (!entry) return;
+    try {
+      const isError = Boolean(item.is_error);
+      const outputStr = safeStringify(item.content);
+      entry.span.setAttributes(
+        redactAttrs({
+          "tool.output": outputStr,
+          "tool.output_size_bytes": Buffer.byteLength(outputStr, "utf8"),
+          "tool.is_error": isError,
+          "tool.paired": true,
+          "langfuse.span.output": outputStr,
+        }),
+      );
+      if (isError) {
+        entry.span.setStatus({
+          code: SpanStatusCode.ERROR,
+          message: "tool_error",
+        });
+      }
+      entry.span.end();
+    } catch {
+      /* swallow */
+    } finally {
+      this.open.delete(id);
+    }
+  }
+}
+
+function safeStringify(value: unknown, maxBytes = 4 * 1024): string {
+  if (value === null || value === undefined) return "";
+  try {
+    const s = typeof value === "string" ? value : JSON.stringify(value);
+    return s.length > maxBytes ? s.slice(0, maxBytes) + "…<truncated>" : s;
+  } catch {
+    return "";
+  }
+}
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON = "transient_failure_retry";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS = BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length;
 type CodexTransientFallbackMode =
@@ -5349,6 +5544,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(eq(heartbeatRuns.id, runId));
 
       const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
+      let toolSpanTracker: ToolSpanTracker | null = null;
+      const toolSpansEnabled =
+        process.env.PAPERCLIP_TOOL_SPANS_ENABLED !== "false";
       const onLog = async (stream: "stdout" | "stderr", chunk: string) => {
         const sanitizedChunk = compactRunLogChunk(
           redactCurrentUserText(chunk, currentUserRedactionOptions),
@@ -5374,6 +5572,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           bytes: persistedLogBytes,
         };
         await flushOutputProgress();
+
+        try {
+          toolSpanTracker?.processChunk(stream, sanitizedChunk);
+        } catch {
+          /* never let telemetry throw from onLog */
+        }
 
         const payloadChunk =
           sanitizedChunk.length > MAX_LIVE_LOG_CHUNK_BYTES
@@ -5538,6 +5742,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         { attributes: runSpanAttrs },
         async (span) => {
           try {
+            try {
+              toolSpanTracker = new ToolSpanTracker(
+                {
+                  "run.id": run.id,
+                  "agent.id": agent.id,
+                  "agent.adapter_type": agent.adapterType,
+                  "company.id": agent.companyId,
+                },
+                toolSpansEnabled,
+              );
+            } catch (err) {
+              logger.warn(
+                { runId: run.id, err: String(err) },
+                "telemetry: ToolSpanTracker init failed; continuing without tool spans",
+              );
+              toolSpanTracker = null;
+            }
             const result = await adapter.execute({
               runId: run.id,
               agent,
@@ -5597,6 +5818,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             }
             throw err;
           } finally {
+            try {
+              toolSpanTracker?.finalize();
+            } catch {
+              /* never let telemetry throw */
+            }
             try {
               span.end();
             } catch {
